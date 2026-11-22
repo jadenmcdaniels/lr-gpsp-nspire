@@ -410,6 +410,8 @@ picture), with `tests/calc_speed.sh`'s model of the ARM926.
   in `docs/licences/BTSTACK-LICENSE.txt`. That licence allows personal, non-commercial use only; a
   build with `BT=0` contains none of it.
 - USB drives: FatFs, copyright ChaN, under its own licence (`fatfs/LICENSE.txt` in nspire-usbms).
+- The five libraries (nspire-usbpad, nspire-usbms, nspire-usbshim, nspire-usbaudio, nspire-bt) are released
+  into the public domain (the Unlicense), apart from the third-party parts each one's README names.
 - The menus' type is drawn from IBM Plex Mono, under the SIL Open Font License 1.1 (`docs/fonts/`).
 
 ## Releases

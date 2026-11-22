@@ -3,7 +3,7 @@
 Version 2.0 beta is the build the About screen calls r19. It runs on the TI-Nspire CX, CX CAS and CX II
 under Ndless.
 
-**This is a beta.** Everything below passes the PC tests (`tests/gate.sh`) and has run on a CX and a CX II,
+**This is a beta.** Everything below passes the PC tests (`tests/gate.sh`) and has run on a CX CAS and a CX II,
 but not in every combination of devices. The least proven part is Bluetooth with a USB hub (the dongle
 on a hub beside a controller, a drive or a sound adapter): use the dongle alone on the OTG adapter when you
 can, and report a freeze with the log files gpSP leaves in zgpSP_files.
