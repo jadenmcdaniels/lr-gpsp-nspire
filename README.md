@@ -2,7 +2,7 @@
 
 Standalone [libretro gpsp](https://github.com/libretro/gpsp) for TI-Nspire calculators (CX, CX CAS, CX II, etc.).
 
-**Version 2.0 beta.** It is a beta: tested on the PC and on a CX and a CX II, not in every combination of
+**Version 2.0 beta.** It is a beta: tested on the PC and on a CX CAS and a CX II, not in every combination of
 devices; Bluetooth with a USB hub is the least proven part. [CHANGES.md](CHANGES.md) lists what it does
 (and where a Realtek Bluetooth dongle's firmware files go); `docs/ui/r19.txt` describes the menus as they
 are now (some sections below describe earlier builds' menus, which r19 replaced).
