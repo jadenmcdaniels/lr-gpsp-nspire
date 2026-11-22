@@ -1,0 +1,148 @@
+Bluetooth controllers and headphones
+====================================
+
+What it takes
+-------------
+A USB Bluetooth dongle on the calculator's USB port (an OTG adapter or a
+USB hub on it, as for a USB controller). The tested design is the TP-Link
+UB500 (2357:0604, Realtek RTL8761BU). A Realtek dongle needs its firmware,
+uploaded at every power-up, from two files in My Documents/zgpSP_files/bt/:
+
+    rtl8761bu_fw.bin.tns      (44484 bytes, linux-firmware's rtl8761bu_fw.bin)
+    rtl8761bu_config.bin.tns  (6 bytes, linux-firmware's rtl8761bu_config.bin)
+
+Without them the dongle runs on its ROM code and may not work; the
+Bluetooth page says the firmware file is missing. CSR (0a12:0001) and
+Broadcom dongles need no file. The paired devices are kept in
+zgpSP_files/bt/bt_keys.dat.tns (written from the menus, never mid-game).
+
+Settings > Bluetooth (the page is ui7's: nspire_devices.c)
+--------------------
+  Bluetooth       On (the default) or Off (enter flips it). On: the driver
+                  waits for a dongle and costs nothing until one comes.
+  Search          The page searches as it opens; enter searches again.
+  PAIRED          The paired devices: enter connects or disconnects, del
+                  forgets (asked first).
+  FOUND           Everything heard nearby, nothing left out: controllers
+                  and headphones first, then the rest, each with its kind
+                  ("WEAK" after it when its signal is: under -75 dBm, the
+                  lowest two of four steps; nothing for a normal one);
+                  enter pairs and connects the picked one.
+  A device being paired or connected says PAIRING or CONNECTING, and the
+  band ENTER STOP: enter on it again stops it (a misclick undone: the band
+  says STOPPED., the device is found, or paired, as it was before), enter
+  once more starts it again. One connect at a time: a second one asked
+  waits its turn (CONNECTING meanwhile); the last headphones' automatic
+  reconnect gives way to the one you asked for, and stopping it on their
+  line keeps it from trying again until you connect them (or they connect
+  by themselves).
+  The band says what is going on: a pairing's outcome, the dongle
+  missing, its firmware file missing, Bluetooth stopped.
+
+Pairing mode: a DualSense: hold Create and PS until its light flashes; a
+Switch Pro Controller: hold the sync button on its top; a DualShock 4:
+Share and PS; an Xbox Wireless Controller (Bluetooth LE: the Series pads,
+the One S and Elite 2 with their 2021 firmware): turn it on with the Xbox
+button, then hold the pair button on its top (by the USB port) until the
+Xbox button flashes fast. A paired controller turned on later connects by
+itself (an LE one when it advertises: gpSP waits for it at a low duty).
+Bluetooth LE controllers work as the Classic ones (the same slots, toasts,
+numbers, Settings > Keys; the Xbox pad's A is A and it is named "Xbox One"
+as on USB). An LE device that is not a controller is not paired with:
+"Only controllers and headphones connect." If LE does not work on the
+dongle, its LE controllers' lines say "This dongle can't connect LE
+controllers." and everything else goes on as before.
+The last headphones used connect when Bluetooth comes on (tried four times
+in a minute; a failed try says nothing).
+
+Controllers
+-----------
+A Bluetooth controller works as a USB one does (the same buttons, layout
+lines in gpsp_usbpad.cfg.tns, the Controls screen). Two at once. They are
+numbered after the highest USB slot in use (the USB controllers keep their
+slots): a USB controller and a DualSense are Controller 1 and Controller 2
+("Controller 2 connected (Bluetooth)"); with only USB slot 2 in use, the
+DualSense is Controller 3. A controller in or out (USB or Bluetooth)
+renumbers them; the pads' lights show the same number, the Controller page
+lists a line per USB slot and each Bluetooth one by that number
+("Controller 2 · Bluetooth  DualSense"). All drive the GBA's one player.
+
+Sound
+-----
+Settings > Sound > Output: Automatic (every output that is in: Bluetooth
+headphones and a USB sound adapter both play; the adapter's sound is held
+back to come out with the headphones', which are ~0.27 s late by their own
+buffering: what their ring and lead measure, averaged, and their A2DP
+delay report, else an estimate of 150 ms for the earbuds' part; a move of
+that delay held 2 s, or a gap in the game's sound, re-syncs the adapter
+with a short fade and a moment of silence), USB adapter (the adapter only:
+the headphones stay connected, paused, nothing encoded), or Bluetooth (the
+headphones only: an adapter is idle, nothing sent to it, when its driver
+has the idle mode; the Sound page says "USB audio idle (Output
+Bluetooth)"). The Sound page's band says "USB audio + Bluetooth:
+NAME" while both play. BT sound: Automatic (mono on a CX, stereo on a CX
+II: SBC encoding costs a CX about 5% of its CPU in mono), Mono, Stereo
+(bitpool 35, A2DP's "middle quality") or High quality (bitpool 53, what
+phones send: clearer highs, 69 packets a second to the dongle instead of
+43); a change takes effect at the headphones' next connect. Paused in the
+menus, sped up in fast forward, as the USB adapter's.
+
+Logs
+----
+gpsp_bt.txt.tns (zgpSP_files, written at the exit once a dongle was seen):
+the dongle's USB attach, its firmware, every HCI command and event in short,
+searches, pairing, the controllers' set-up, the headphones' stream, the
+stop; while headphones stream, a line a second at its end (the frame's
+USB interrupt window, the poll and the sound's write in ms; media packets,
+SBC frames, the ring, the rate, late frames, underruns, trims).
+gpsp_pad.txt.tns has Bluetooth's lines too (on, off, controllers and
+headphones coming and going, the stop). gpsp_bt.txt.tns is written on the
+exit's restart path too (a USB shutdown that timed out).
+
+Exit and failures
+-----------------
+quit() writes the key store first (the stop writes no file), then gives
+Bluetooth half of what the USB shutdowns have left (1.5 s at most): under
+600 ms nothing is asked of the radio (the links end with the dongle's
+power); a USB callback still inside gpSP then means the exit's restart. An
+exit() that didn't come through quit() stops Bluetooth before the pad
+driver (its handler is registered after the pad driver's). Every wait is
+bounded by polls or sleeps as well as by time (an older CX's timer may not
+run). A BTstack assert (an internal check) gives the dongle up: "Bluetooth
+stopped", the game goes on, the dongle no longer counts as a working
+device (a replug or the port's restart starts over); one with no library
+call to return to writes the game's save and the logs, then restarts the
+calculator as an exit that timed out. Leaving Settings > Sound applies the
+codec only: a Bluetooth that failed stays stopped until turned on again.
+
+Build
+-----
+The Makefile builds ../nspire-bt's library (make -C ../nspire-bt lib: the
+profiles, BTstack 1.8.3, the calculator port; -Os, the SBC encoder -O2) and
+links it when ../nspire-bt is there; BT=0 (or no ../nspire-bt) builds
+without Bluetooth (-DNSPIRE_NO_BT). The one nspire-usbshim is gpSP's.
+Options: BT_LE=full (the default since r19-bt: LE controllers connect;
++25.0 KB of gpsp.tns against scan), scan (a search lists Bluetooth LE
+devices, none connects), off (Classic only); BT_AVRCP=0 (the default: the
+headphones' volume in the samples) or 1 (absolute volume, the headphones'
+keys: +10.0 KB).
+
+The switch file zgpSP_files/bt/bt_port.cfg.tns (optional; nspire-bt
+docs/calc-port.md): requeue=main|callback, out=handover|main,
+intr_recover=on|off, log_level=0|1|2, for a run that compares the USB
+transport's two ways on the calculator without a rebuild.
+
+Tests
+-----
+tests/host/bt_tests.py (in tests/host/run.sh) on host_bt.c, a stand-in for
+the library: no dongle costs nothing, the pads' numbers (USB slots 0/1), the
+sound's routing (Output exclusive), the page, the settings, the exit (its
+order, a stop that spends time, a polite part, a stopped timer, the
+restart's path with gpsp_bt.txt.tns), an assert under a guard and the fatal
+hook, the poll in the frames' OS time, the headphones' delay and the rate
+in gpsp_bt.txt.tns; tests/audio/sink_test.c: Output on the USB adapter's
+side, its re-syncs to the headphones, its idle; tests/audio/pace_test.c
+--case idle: what the idle adapter saves. tests/host/ui_wired.sh OUT bluetooth: the
+page's screens. tests/bt/btbench.py: what Bluetooth costs a frame on the
+calculator's CPU (the speed model). nspire-bt's own tests cover the library.
+Not verified on a calculator.

@@ -1,0 +1,63 @@
+USB game sound
+==============
+
+Settings > Sound controls USB audio, volume, stereo/mono and buffering.
+Settings can be kept for all games or for the current game. An older
+settings file starts with sound enabled, volume 70%, stereo, short buffer.
+
+The USB Audio Class 1 driver selects a supported output rate from the
+adapter, preferring rates whose 1 ms packet fits in a single 188-byte USB
+start-split (44.1 kHz stereo 16-bit is 176/180 bytes, preferred over 48 kHz
+stereo 16-bit at 192 bytes because 2-split siTDs stall for a 1024-frame lap
+on CX II, and the in-memory endpoint descriptor's wMaxPacketSize is clamped
+to the chosen rate's max packet so the CX II OS sets a 1-split S-mask).
+The GBA mixer still runs at 65536 Hz; integer resampling converts
+that to the device's rate. Manual mixer-rate selection is not implemented.
+The reusable driver excludes unsupported packet sizes rather than overflowing
+a transfer buffer.
+
+The sound page reports the adapter connection and selected rate. Connecting
+an adapter does not prove its analog output is audible. Actual calculator
+headphone playback and simultaneous physical controller/audio operation
+still need verification; the host tests simulate the USB task.
+
+Menus, fast forward, mute, loads, restarts and ROM changes discard old PCM.
+The USB stream sends silence while paused. Packets already submitted can
+finish for up to 48 ms; their buffers are never overwritten while the OS
+owns them. Short/medium/long prime 32/64/96 ms of new PCM, capped to the
+8192-frame ring at high device rates. Ring overflow drops output rather
+than blocking emulation. A missing adapter uses the silent APU timing path.
+
+USB gets bounded OS service during games, menus and fast forward. An
+attached adapter, including a failed setup or draining transfer, prevents
+link takeover and USB power cycling. Quit drains audio before returning
+the display/keypad to the OS. A pending cleanup displays a closing screen;
+unplug the adapter if it does not finish. No timeout frees live callbacks.
+
+Build
+-----
+Use nspire-usbaudio with safe discard/ownership support (b8bd0cf or later),
+nspire-usbshim d99f163 or later, and the controller and drive backends of the
+same round.
+The Makefile enables USB_AUDIO when the sibling library is available;
+USB_AUDIO=0 retains a silent build. USB_AUDIO_DIR can name another checkout.
+All users of pcm.h share RING_FRAMES=8192. Exactly one usbshim is linked,
+including when pads and drives are disabled. A build-flags stamp rebuilds
+objects when features or library paths change.
+
+Validation
+----------
+tests/audio/unit_runtime.sh checks ARM926 silent/enabled/toggled APU state
+parity, FIFO boundaries, reset/load clearing and the unchanged tone reference.
+The real mixer/resampler/ua_os pipeline is tested with the captured TI ABI
+fake, under ASan/UBSan/alignment checking:
+
+  make -C tests/host -f ../audio/sink.mk BUILD=build-sink SAN=1
+  tests/host/build-sink/sink_test
+  make -C tests/host -f ../audio/sink_boundaries.mk BUILD=build-sink-bounds SAN=1
+  tests/host/build-sink-bounds/sink_boundaries_test
+
+These cover nonzero PCM at 48/44.1 kHz, mono/volume, bounded overflow,
+pause/reset/FF before any USB yield, unplug/replug and delayed teardown.
+tests/host/audio_ui_tests.py exercises the Sound page, cancel and persistence.
+No saved PCM reference is updated for the sink integration.

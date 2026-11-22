@@ -1,0 +1,8 @@
+# tests/gate.sh: the fewest results each part's log may show (checks, pictures, PASS lines); fewer is FAIL
+# (a check removed). Measured on final/r19 before tests/gate.sh; raise them when tests are added.
+host 90940
+ui 220
+drive 3371
+audio 15
+arm 38
+calc 2

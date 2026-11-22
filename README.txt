@@ -83,5 +83,5 @@ Notes
 
   Core video is libretro-gpsp/video.cc (240-pitch GBA buffer). Before calling
   nspire/upscale_aspect.S, nspire_video_present.c copies each row into a 320-pitch
-  scratch buffer (the asm scalers match legacy video.c layout). nspire_video_ui.c
-  handles the menu framebuffer; nspire/video_blend.S is used for expand_blend.
+  scratch buffer (the layout the asm scalers expect). nspire_video_ui.c
+  handles the menu framebuffer.

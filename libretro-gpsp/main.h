@@ -97,7 +97,9 @@ void game_name_ext(char *src, char *buffer, char *extension);
 
 #ifdef NSPIRE_LIBRETRO
 extern u32 clock_speed;
-extern frameskip_type current_frameskip_type;
+/* A frameskip_type value; 32 bits because the menu edits it through a u32
+ * pointer (enums are one byte with the Nspire toolchain). */
+extern u32 current_frameskip_type;
 extern u32 frameskip_value;
 extern u32 random_skip;
 /* 0 = built-in open BIOS, 1 = gba_bios.bin.tns next to executable */
@@ -110,8 +112,6 @@ extern u32 nspire_lcd_cache_clean_full;
 extern u32 nspire_fps_overlay;
 /* 1 = skip BLDCNT alpha / fade / semi-transparent combine in video.cc (faster). */
 extern u32 nspire_gba_blend_off;
-/* 0 = libretro video.cc renderer; 1 = legacy old_video/video.c renderer. */
-extern u32 nspire_video_renderer_choice;
 /* 0 = partial SMC + conservative RAM branch emits (default). 1 = classic:
  * flush_dynarec_caches() on SMC and full PC-relative block linking from RAM
  * code (same as ROM emits). */

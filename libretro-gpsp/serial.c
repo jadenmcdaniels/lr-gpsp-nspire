@@ -20,8 +20,17 @@
 #include "common.h"
 
 int serial_mode = SERIAL_MODE_AUTO;
+// Set while a link cable is linked (nspire_link.c): unlinked, a cable
+// transfer needs nothing from the other end, and the events skip it.
+int cable_linked = 0;
 
 static u32 serial_irq_cycles = 0;
+
+// nspire R4 (the link's log): the game's writes to SIOCNT/RCNT (what it
+// wrote, what the register holds after), and how many transfers it started
+// and serial IRQs it got. Weak: the programs without nspire_link.c.
+void nspire_link_sio_write(int is_rcnt, u16 written, u16 now) __attribute__((weak));
+u32 serial_transfer_starts, serial_irqs_raised;
 
 // Timings are very aproximate, hopefully they are good enough.
 #define CLOCK_CYC_256KHZ_8BIT        524    // CLOCK / 256KHz * 8
@@ -67,10 +76,13 @@ uint16_t serial_mul_siocnt() {
 
 cpu_alert_type write_rcnt(u16 value) {
   u16 oldval = read_ioreg(REG_RCNT);
-  u32 pvmode = get_serial_mode(oldval, read_ioreg(REG_RCNT));
-  u32 nwmode = get_serial_mode(value, read_ioreg(REG_RCNT));
+  u32 pvmode = get_serial_mode(read_ioreg(REG_SIOCNT), oldval);
+  u32 nwmode = get_serial_mode(read_ioreg(REG_SIOCNT), value);
 
   write_ioreg(REG_RCNT, value);
+
+  if (nspire_link_sio_write)
+    nspire_link_sio_write(1, value, value);
 
   switch (nwmode) {
   case SERIAL_MODE_GPIO:
@@ -165,11 +177,18 @@ cpu_alert_type write_siocnt(u16 value) {
         CLOCK_CYC_9600_16BIT, CLOCK_CYC_38400_16BIT,
         CLOCK_CYC_57600_16BIT, CLOCK_CYC_115200_16BIT };
       serial_irq_cycles = tim[newval & 0x3] * (netplay_num_clients + 1);
+      serial_transfer_starts++;
 
-      if (serial_mode == SERIAL_MODE_SERIAL_POKE)
+      if (serial_mode == SERIAL_MODE_CABLE)
+        cable_transfer_start(newval, serial_irq_cycles);
+      else if (serial_mode == SERIAL_MODE_SERIAL_POKE)
         serialpoke_master_send();
       else if (serial_mode == SERIAL_MODE_SERIAL_AW1 || serial_mode == SERIAL_MODE_SERIAL_AW2)
         serialaw_master_send();
+      else if (serial_mode == SERIAL_MODE_SERIAL_FE)
+        serialfe_master_send();
+      else if (serial_mode == SERIAL_MODE_SERIAL_MSIO)
+        serialmsio_master_send(serial_irq_cycles);
     }
 
     break;
@@ -178,32 +197,67 @@ cpu_alert_type write_siocnt(u16 value) {
   // Update reg with its new value
   write_ioreg(REG_SIOCNT, newval);
 
+  if (nspire_link_sio_write)
+    nspire_link_sio_write(0, value, newval);
+
   return CPU_ALERT_NONE;
 }
 
+// The link cable's other end (a child) starts a transfer the parent began:
+// busy now, done (words in, IRQ) in the given cycles.
+void serial_cable_busy(u32 cycles) {
+  serial_irq_cycles = cycles ? cycles : 1;
+  write_ioreg(REG_SIOCNT, read_ioreg(REG_SIOCNT) | 0x80);
+}
+
+// The cycles left of the transfer under way (0: none).
+u32 serial_busy_cycles(void) {
+  return serial_irq_cycles;
+}
+
 // How many cycles until the next serial event happens. Return MAX otherwise.
-u32 serial_next_event() {
+NSPIRE_HOT u32 serial_next_event() {
+  if (cable_linked) {
+    u32 c = cable_next_event();
+    return serial_irq_cycles ? MIN(serial_irq_cycles, c) : c;
+  }
   if (serial_irq_cycles)
     return serial_irq_cycles;
   return ~0U;
 }
 
 // Account for consumed cycles and return if a serial IRQ should be raised.
-bool update_serial(unsigned cycles) {
-  // Might wanna check if the connected device has some update (IRQ).
+NSPIRE_HOT bool update_serial(unsigned cycles) {
+  // Might want to check if the connected device has some update (IRQ).
   switch (serial_mode) {
   case SERIAL_MODE_RFU:
     if (rfu_update(cycles))
       return true;
     break;
   case SERIAL_MODE_SERIAL_POKE:
-    if (serialpoke_update(cycles))
+    if (serialpoke_update(cycles)) {
+      serial_irqs_raised++;
       return true;
+    }
     break;
   case SERIAL_MODE_SERIAL_AW1:
   case SERIAL_MODE_SERIAL_AW2:
     if (serialaw_update(cycles))
       return true;
+    break;
+  case SERIAL_MODE_SERIAL_FE:
+    if (serialfe_update(cycles))
+      return true;
+    break;
+  case SERIAL_MODE_CABLE:
+    if (cable_linked)
+      cable_update(cycles);
+    break;
+  case SERIAL_MODE_SERIAL_MSIO:
+    // A transfer at a time: the next once this one's IRQ has been taken
+    // (the game reads its words and gives its next first).
+    if (!serial_irq_cycles)
+      serialmsio_update(cycles);
     break;
   };
 
@@ -220,6 +274,7 @@ bool update_serial(unsigned cycles) {
 
   // Handle IRQ trigger schedule.
   if (trigger_irq) {
+    serial_irqs_raised++;
     switch (get_serial_mode(read_ioreg(REG_SIOCNT), read_ioreg(REG_RCNT))) {
     case SERIAL_MODE_NORMAL:
       // Clear the send bit, signal data is ready.
@@ -228,6 +283,8 @@ bool update_serial(unsigned cycles) {
       // Return if IRQs are enabled.
       return read_ioreg(REG_SIOCNT) & 0x4000;
     case SERIAL_MODE_MULTI:
+      if (serial_mode == SERIAL_MODE_CABLE)
+        cable_transfer_done();   // the words land now, as on the GBA
       // Clear the start bit, signal data is ready.
       write_ioreg(REG_SIOCNT, (read_ioreg(REG_SIOCNT) & ~0x80));
       // Return if IRQs are enabled.

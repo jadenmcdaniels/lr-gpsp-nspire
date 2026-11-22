@@ -26,6 +26,12 @@
 #include <errno.h>
 #include <sys/types.h>
 
+#ifdef NSPIRE_BUILD
+/* Read-only removable media is supplied by the frontend. Core-only tools
+ * do not link a USB driver and simply reject this path scheme. */
+extern FILE *nspire_drive_fopen(const char *, const char *) __attribute__((weak));
+#endif
+
 #include <string/stdstring.h> /* string_is_empty */
 
 #ifdef HAVE_CONFIG_H
@@ -376,6 +382,11 @@ libretro_vfs_implementation_file *retro_vfs_file_open_impl(
 #endif
       stream->hints &= ~RETRO_VFS_FILE_ACCESS_HINT_FREQUENT_ACCESS;
 
+#ifdef NSPIRE_BUILD
+   if (!strncmp(path, "usb:/", 5))
+      stream->hints &= ~(RFILE_HINT_UNBUFFERED | RETRO_VFS_FILE_ACCESS_HINT_FREQUENT_ACCESS);
+#endif
+
    switch (mode)
    {
       case RETRO_VFS_FILE_ACCESS_READ:
@@ -442,7 +453,13 @@ libretro_vfs_implementation_file *retro_vfs_file_open_impl(
       else
 #endif
       {
-         if (!(fp = (FILE*)fopen_utf8(path, mode_str)))
+#ifdef NSPIRE_BUILD
+         if (!strncmp(path, "usb:/", 5))
+            fp = nspire_drive_fopen ? nspire_drive_fopen(path, mode_str) : NULL;
+         else
+#endif
+            fp = (FILE*)fopen_utf8(path, mode_str);
+         if (!fp)
             goto error;
 
          stream->fp  = fp;
@@ -468,6 +485,12 @@ libretro_vfs_implementation_file *retro_vfs_file_open_impl(
          if (stream->fp)
             setvbuf(stream->fp, stream->buf, _IOFBF, 0x10000);
       }
+#elif defined(NSPIRE_LIBRETRO)
+      /* Nspire users read and write big blocks only; libsyscalls' _fstat
+       * fails, so stdio would give each FILE a 1 KB buffer and split a 128 KB
+       * read into 128 OS reads plus a copy. */
+      if (stream->fp)
+         setvbuf(stream->fp, NULL, _IONBF, 0);
 #elif defined(WIIU)
       if (stream->scheme != VFS_SCHEME_CDROM)
       {

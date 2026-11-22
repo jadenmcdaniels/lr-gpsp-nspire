@@ -33,39 +33,45 @@ cheat_type core_cheat_slots[MAX_CHEATS];
 u32 max_cheat = 0;
 u32 cheat_master_hook = 0xffffffff;
 
-static bool has_encrypted_codebreaker(cheat_type *cheat)
+/* Continuation lines are payload, even when their first nibble happens
+ * to look like an encrypted or master opcode. */
+static unsigned codebreaker_extra(const cheat_type *cheat, unsigned i)
 {
-  int i;
-  for(i = 0; i < cheat->cheat_count; i++)
-  {
-     u32 code    = cheat->codes[i].address;
-     u32 opcode  = code >> 28;
-     if (opcode == 9)
-        return true;
-  }
-  return false;
+  unsigned opcode = cheat->codes[i].address >> 28;
+  if (opcode == 4)
+    return 1;
+  if (opcode == 5)
+    return ((cheat->codes[i].value & 0xffff) * 2 + 5) / 6;
+  return 0;
 }
 
-static void update_hook_codebreaker(cheat_type *cheat)
+static void update_hook_codebreaker(void)
 {
-  int i;
-  for(i = 0; i < cheat->cheat_count; i++)
+  unsigned slot, i;
+  u32 hook = 0xffffffff;
+  for (slot = 0; slot <= max_cheat; slot++)
   {
-     u32 code    = cheat->codes[i].address;
-     u32 address = code & 0xfffffff;
-     u32 opcode  = code >> 28;
-
-     if (opcode == 1)
-     {
-        u32 pcaddr = 0x08000000 | (address & 0x1ffffff);
-        #ifdef HAVE_DYNAREC
-        if (cheat_master_hook != pcaddr)
-           flush_dynarec_caches();   /* Flush caches to install hook */
-        #endif
-        cheat_master_hook = pcaddr;
-        return;   /* Only support for one hook */
-     }
+    const cheat_type *cheat = &core_cheat_slots[slot];
+    if (!cheat->cheat_active)
+      continue;
+    for (i = 0; i < cheat->cheat_count; i++)
+    {
+      u32 code = cheat->codes[i].address;
+      if ((code >> 28) == 1)
+      {
+        hook = 0x08000000 | (code & 0x1ffffff);
+        break;
+      }
+      i += codebreaker_extra(cheat, i);
+    }
+    if (hook != 0xffffffff)
+      break; /* The core supports one hook. */
   }
+#ifdef HAVE_DYNAREC
+  if (cheat_master_hook != hook)
+    flush_dynarec_caches();
+#endif
+  cheat_master_hook = hook;
 }
 
 static void process_cheat_codebreaker(cheat_type *cheat, u16 pad)
@@ -108,6 +114,8 @@ static void process_cheat_codebreaker(cheat_type *cheat, u16 pad)
       for (j = 0; j < value * 2 && i < cheat->cheat_count; j++)
       {
         u8 bvalue, off = j % 6;
+        if (!off && i + 1 >= cheat->cheat_count)
+          break;
         switch (off) {
         case 0:
           bvalue = cheat->codes[++i].address >> 24;
@@ -194,72 +202,83 @@ void process_cheats(void)
    }
 }
 
-void cheat_clear()
+void cheat_clear(void)
 {
-   int i;
-   for (i = 0; i < MAX_CHEATS; i++)
-   {
-      core_cheat_slots[i].cheat_count = 0;
-      core_cheat_slots[i].cheat_active = false;
-   }
-   cheat_master_hook = 0xffffffff;
+   memset(core_cheat_slots, 0, sizeof(core_cheat_slots));
+   max_cheat = 0;
+   update_hook_codebreaker();
+}
+
+static int cheat_hex(char c)
+{
+   if (c >= '0' && c <= '9') return c - '0';
+   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+   return -1;
 }
 
 cheat_error cheat_parse(unsigned index, const char *code)
 {
-   int pos = 0;
-   int codelen = strlen(code);
-   cheat_type *ch = &core_cheat_slots[index];
+   unsigned pos = 0, codelen, i;
+   cheat_type parsed = {0};
    char buf[1024];
-   
    if (index >= MAX_CHEATS)
       return CheatErrorTooMany;
+   if (!code)
+      return CheatErrorNotSupported;
+   codelen = strnlen(code, sizeof(buf));
    if (codelen >= sizeof(buf))
       return CheatErrorTooBig;
+   memcpy(buf, code, codelen + 1);
+   for (i = 0; i < codelen; i++)
+      if (cheat_hex(buf[i]) < 0)
+         buf[i] = ' ';
 
-   memcpy(buf, code, codelen+1);
-   
-   /* Init to a known good state */
-   ch->cheat_count = 0;
-   if (index > max_cheat)
-      max_cheat = index;
-
-   /* Replace all the non-hex chars to spaces */
-   for (pos = 0; pos < codelen; pos++)
-      if (!((buf[pos] >= '0' && buf[pos] <= '9') ||
-            (buf[pos] >= 'a' && buf[pos] <= 'f') ||
-            (buf[pos] >= 'A' && buf[pos] <= 'F')))
-         buf[pos] = ' ';
-
-   /* Try to parse as Code Breaker */
-   pos = 0;
+   /* Parse the actual token lengths: the old fixed pos += 13 assumed
+    * exactly one separator, and could reread or silently drop digits. */
    while (pos < codelen)
    {
-      u32 op1; u16 op2;
-      if (2 != sscanf(&buf[pos], "%08x %04hx", &op1, &op2))
-         break;
-      ch->codes[ch->cheat_count].address = op1;
-      ch->codes[ch->cheat_count++].value = op2;
-      pos += 13;
-      while (pos < codelen && buf[pos] == ' ')
-         pos++;
-      if (ch->cheat_count >= MAX_CHEAT_CODES)
-         break;
+      unsigned j;
+      u32 address = 0, value = 0;
+      while (pos < codelen && buf[pos] == ' ') pos++;
+      if (pos == codelen) break;
+      if (parsed.cheat_count == MAX_CHEAT_CODES)
+         return CheatErrorTooBig;
+      for (j = 0; j < 8; j++)
+      {
+         if (pos == codelen || cheat_hex(buf[pos]) < 0)
+            return CheatErrorNotSupported;
+         address = (address << 4) | cheat_hex(buf[pos++]);
+      }
+      while (pos < codelen && buf[pos] == ' ') pos++;
+      for (j = 0; j < 4; j++)
+      {
+         if (pos == codelen || cheat_hex(buf[pos]) < 0)
+            return CheatErrorNotSupported;
+         value = (value << 4) | cheat_hex(buf[pos++]);
+      }
+      if (pos < codelen && buf[pos] != ' ')
+         return CheatErrorNotSupported;
+      parsed.codes[parsed.cheat_count].address = address;
+      parsed.codes[parsed.cheat_count++].value = value;
    }
-   
-   if (pos >= codelen)
+   if (!parsed.cheat_count)
+      return CheatErrorNotSupported;
+   for (i = 0; i < parsed.cheat_count; i++)
    {
-      /* Check whether these cheats are readable */
-      if (has_encrypted_codebreaker(ch))
+      unsigned extra = codebreaker_extra(&parsed, i);
+      if (extra > parsed.cheat_count - i - 1)
+         return CheatErrorNotSupported;
+      if ((parsed.codes[i].address >> 28) == 9)
          return CheatErrorEncrypted;
-      /* All codes were parsed! Process hook here */
-      ch->cheat_active = true;
-      update_hook_codebreaker(ch);
-      return CheatNoError;
+      i += extra;
    }
-
-   /* TODO parse other types here */
-   return CheatErrorNotSupported;
+   /* Commit only a complete code: a rejected replacement must not leave
+    * its partially parsed writes enabled in the old slot. */
+   parsed.cheat_active = true;
+   core_cheat_slots[index] = parsed;
+   if (index > max_cheat)
+      max_cheat = index;
+   update_hook_codebreaker();
+   return CheatNoError;
 }
-
-

@@ -562,6 +562,7 @@ const u8 bit_count[256] =
   new_pc_region = (reg[REG_PC] >> 15);                                        \
   if(new_pc_region != pc_region)                                              \
   {                                                                           \
+    nspire_stop_if_nowhere();                                                 \
     pc_region = new_pc_region;                                                \
     pc_address_block = memory_map_read[new_pc_region];                        \
     touch_gamepak_page(pc_region);                                            \
@@ -1361,7 +1362,7 @@ const u32 cpu_modes[16] =
 
 u32 instruction_count = 0;
 
-void set_cpu_mode(cpu_mode_type new_mode)
+NSPIRE_HOT void set_cpu_mode(cpu_mode_type new_mode)
 {
   cpu_mode_type cpu_mode = reg[CPU_MODE];
 
@@ -1393,18 +1394,20 @@ void set_cpu_mode(cpu_mode_type new_mode)
   reg[CPU_MODE] = new_mode;
 }
 
+// IE & IF first: it is almost always 0 when update_gba asks, and all three
+// tests are pure reads, so the order does not change the answer.
 #define cpu_has_interrupt()                                 \
-  (!(reg[REG_CPSR] & 0x80) && read_ioreg(REG_IME) &&        \
-    (read_ioreg(REG_IE) & read_ioreg(REG_IF)))
+  ((read_ioreg(REG_IE) & read_ioreg(REG_IF)) &&             \
+    read_ioreg(REG_IME) && !(reg[REG_CPSR] & 0x80))
 
 // Returns whether the CPU has a pending interrupt.
-cpu_alert_type check_interrupt() {
+NSPIRE_HOT cpu_alert_type check_interrupt() {
   return (cpu_has_interrupt()) ? CPU_ALERT_IRQ : CPU_ALERT_NONE;
 }
 
 // Checks for pending IRQs and raises them. This changes the CPU mode
 // which means that it must be called with a valid CPU state.
-u32 check_and_raise_interrupts()
+NSPIRE_HOT u32 check_and_raise_interrupts()
 {
   // Check any IRQ flag pending, IME and CPSR-IRQ enabled
   if (cpu_has_interrupt())
@@ -1434,7 +1437,7 @@ u32 check_and_raise_interrupts()
 // It simply updates IF register and returns whether the IRQ needs
 // to be raised (that is, IE/IME/CPSR enable the IRQ).
 // Safe to call via dynarec without proper registers saved.
-cpu_alert_type flag_interrupt(irq_type irq_raised)
+NSPIRE_HOT cpu_alert_type flag_interrupt(irq_type irq_raised)
 {
   // Flag interrupt
   write_ioreg(REG_IF, read_ioreg(REG_IF) | irq_raised);
@@ -1460,18 +1463,47 @@ u8 vram[1024 * 96];
 u16 io_registers[512];
 #endif
 
+#ifdef NSPIRE_LIBRETRO
+u32 nspire_bad_jump, nspire_bad_jump_pc;
+
+/* Where no code can run: no memory (region 01), the I/O registers (04),
+ * the cartridge's save memory (0E, 0F) and anything above, which
+ * memory_map_read doesn't even cover. */
+static bool nspire_pc_runs_nowhere(u32 pc)
+{
+  u32 region = pc >> 24;
+  return region == 0x01 || region == 0x04 || region >= 0x0E;
+}
+#define nspire_stop_if_nowhere()                                              \
+  if (nspire_pc_runs_nowhere(reg[REG_PC]))                                    \
+  {                                                                           \
+    nspire_bad_jump = 1;                                                      \
+    nspire_bad_jump_pc = reg[REG_PC];                                         \
+    return;                                                                   \
+  }
+#else
+#define nspire_stop_if_nowhere()
+#endif
+
+/* The calculator runs games on the dynarec only (dynarec_enable is always
+ * 1 there), so its build leaves the interpreter out (NSPIRE_NO_INTERPRETER,
+ * the Makefile): 65 KB of the program file. The PC tests and the ARM tests
+ * keep it. */
+#ifndef NSPIRE_NO_INTERPRETER
 void execute_arm(u32 cycles)
 {
   u32 opcode;
   u32 condition;
   u32 n_flag, z_flag, c_flag, v_flag;
   u32 pc_region = (reg[REG_PC] >> 15);
-  u8 *pc_address_block = memory_map_read[pc_region];
+  u8 *pc_address_block;
   u32 new_pc_region;
   s32 cycles_remaining;
   u32 update_ret;
   cpu_alert_type cpu_alert;
 
+  nspire_stop_if_nowhere();
+  pc_address_block = memory_map_read[pc_region];
   if(!pc_address_block)
     pc_address_block = load_gamepak_page(pc_region & 0x3FF);
   touch_gamepak_page(pc_region);
@@ -3543,6 +3575,7 @@ thumb_loop:
       collapse_flags();
   }
 }
+#endif /* NSPIRE_NO_INTERPRETER */
 
 void init_cpu(void)
 {
@@ -3577,16 +3610,19 @@ void init_cpu(void)
 
 bool cpu_check_savestate(const u8 *src)
 {
-  const u8 *cpudoc = bson_find_key(src, "cpu");
-  if (!cpudoc)
+  u32 regs[REG_ARCH_COUNT];
+  const u8 *cpudoc = bson_find_document(src, "cpu");
+  if (!cpudoc || !bson_contains_key(cpudoc, "bus-value", BSON_TYPE_INT32) ||
+      !bson_read_int32_array(cpudoc, "regs", regs, REG_ARCH_COUNT) ||
+      !bson_check_int32_array(cpudoc, "spsr", 6) ||
+      !bson_check_int32_array(cpudoc, "regmod", 7 * 7))
     return false;
-
-  return bson_contains_key(cpudoc, "bus-value", BSON_TYPE_INT32) &&
-         bson_contains_key(cpudoc, "regs", BSON_TYPE_ARR) &&
-         bson_contains_key(cpudoc, "spsr", BSON_TYPE_ARR) &&
-         bson_contains_key(cpudoc, "regmod", BSON_TYPE_ARR);
+  /* The mode indexes the banked register and SPSR arrays on the next
+   * interrupt or mode switch. Other values are never valid bank indexes. */
+  return (regs[CPU_MODE] == MODE_USER ||
+          (regs[CPU_MODE] >= MODE_SYSTEM && regs[CPU_MODE] <= MODE_UNDEFINED)) &&
+         regs[CPU_HALT_STATE] <= CPU_DMA;
 }
-
 
 bool cpu_read_savestate(const u8 *src)
 {

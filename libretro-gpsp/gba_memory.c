@@ -22,79 +22,14 @@
 
 #ifdef NSPIRE_LIBRETRO
 #include <strings.h>
+#include "../nspire_gbz.h"
+#include "../nspire_zip.h"
+#include "../nspire_states.h"
+#include "../nspire_os.h"
 extern u32 nspire_rom_buffer_size_choice;
 #endif
 
-#ifdef NSPIRE_NO_AUDIO
-/*
- * Nspire has no speaker output. NSPIRE_NO_AUDIO already makes render_gbc_sound()
- * and sound_timer() skip mixing; games still touch sound MMIO and timers.
- * Replace runtime double math in these paths with integer-fixed equivalents
- * (GBC tone steps cancel sound_frequency; timer step uses GBC_BASE_RATE_INT).
- */
-#define NSPIRE_FP16_ONE_TWELFTH ((fixed16_16)(65536u / 12u))
-
-static inline fixed16_16 nspire_fp16_tone_square_channel(u32 rate)
-{
-  u32 den = 2048u - (rate & 2047u);
-  if (den == 0u)
-    den = 1u;
-  return (fixed16_16)(1048576u / den);
-}
-
-static inline fixed16_16 nspire_fp16_tone_wave_channel(u32 rate)
-{
-  u32 den = 2048u - (rate & 2047u);
-  if (den == 0u)
-    den = 1u;
-  return (fixed16_16)(2097152u / den);
-}
-
-static inline fixed16_16 nspire_fp16_noise_step(u32 dividing_ratio, u32 frequency_shift)
-{
-  u32 sh = (frequency_shift & 15u) + 1u;
-  u32 divisor = 1u << sh;
-
-  if (dividing_ratio == 0u)
-    return (fixed16_16)(1048576u / divisor);
-  return (fixed16_16)(524288u / (dividing_ratio * divisor));
-}
-
-static inline fixed8_24 nspire_fp8_timer_reload_step(u32 timer_reload)
-{
-  unsigned long long num;
-
-  if (timer_reload == 0u)
-    return (fixed8_24)0;
-  /* Same as float_to_fp8_24((GBC_BASE_RATE / sound_frequency) / timer_reload). */
-  num = (unsigned long long)GBC_BASE_RATE_INT * 16777216ull /
-        (unsigned long long)GBA_SOUND_FREQUENCY;
-  return (fixed8_24)(num / (unsigned long long)timer_reload);
-}
-
-#define gbc_fp16_tone_square(rate)     nspire_fp16_tone_square_channel(rate)
-#define gbc_fp16_tone_wave(rate)       nspire_fp16_tone_wave_channel(rate)
-#define gbc_fp16_noise(dr, fs)         nspire_fp16_noise_step((dr), (fs))
-#define gbc_fp16_sample_phase12()      NSPIRE_FP16_ONE_TWELFTH
-#define sound_update_frequency_step(timer_number)                             \
-  timer[timer_number].frequency_step = nspire_fp8_timer_reload_step(timer_reload)
-#else
-#define gbc_fp16_tone_square(rate)                                            \
-  float_to_fp16_16(((131072.0 / (2048 - (rate))) * 8.0) / sound_frequency)
-#define gbc_fp16_tone_wave(rate)                                              \
-  float_to_fp16_16((2097152.0 / (2048 - (rate))) / sound_frequency)
-#define gbc_fp16_noise(dividing_ratio, frequency_shift)                       \
-  ((dividing_ratio) == 0                                                      \
-     ? float_to_fp16_16(1048576.0 / (1 << ((frequency_shift) + 1)) /          \
-                        sound_frequency)                                      \
-     : float_to_fp16_16(524288.0 / ((dividing_ratio) *                         \
-                                   (1 << ((frequency_shift) + 1))) /          \
-                        sound_frequency))
-#define gbc_fp16_sample_phase12()      float_to_fp16_16(1.0 / 12.0)
-#define sound_update_frequency_step(timer_number)                             \
-  timer[timer_number].frequency_step =                                        \
-   float_to_fp8_24((GBC_BASE_RATE / sound_frequency) / (timer_reload))
-#endif /* NSPIRE_NO_AUDIO */
+/* The frequency steps (integer, both builds): sound_steps.h via sound.h. */
 
 /* Sound */
 #define gbc_sound_tone_control_low(channel, regn)                             \
@@ -151,7 +86,7 @@ static inline fixed8_24 nspire_fp8_timer_reload_step(u32 timer_reload)
 {                                                                             \
   render_gbc_sound();                                                         \
   gbc_sound_channel[2].wave_type = (value >> 5) & 0x01;                       \
-  gbc_sound_channel[2].wave_bank = (value >> 6) & 0x01;                       \
+  sound_select_wave_bank((value >> 6) & 0x01);                                \
   gbc_sound_channel[2].master_enable = 0;                                     \
   if(value & 0x80)                                                            \
     gbc_sound_channel[2].master_enable = 1;                                   \
@@ -182,7 +117,9 @@ static const u32 gbc_sound_wave_volume[4] = { 0, 16384, 8192, 4096 };
   gbc_sound_channel[2].length_status = (value >> 14) & 0x01;                  \
   if(value & 0x8000)                                                          \
   {                                                                           \
-    gbc_sound_channel[2].sample_index = 0;                                    \
+    gbc_sound_channel[2].sample_index =                                      \
+      gbc_sound_channel[2].wave_type ?                                       \
+      (gbc_sound_channel[2].wave_bank << 21) : 0;                             \
     gbc_sound_channel[2].active_flag = 1;                                     \
   }                                                                           \
   write_ioreg(REG_SOUND3CNT_X, value);                                        \
@@ -220,7 +157,7 @@ static void gbc_trigger_sound(u32 value)
       gbc_sound_master_volume_right = value & 0x07;
       gbc_sound_master_volume_left = (value >> 4) & 0x07;
       gbc_sound_channel[channel].status =
-        (((value >> (channel + 8)) & 0x1) | ((value >> (channel + 11)) & 0x3));
+        (((value >> (channel + 8)) & 0x1) | ((value >> (channel + 11)) & 0x2));
    }
    write_ioreg(REG_SOUNDCNT_L, value & 0xFF77);
 }
@@ -278,9 +215,18 @@ static const u32 prescale_table[] = { 0, 6, 8, 10 };
     sound_update_frequency_step(timer_number);                                \
   }                                                                           \
 
+/* core-04: the channel's counted pops go into its fraction (and index)
+ * before the index is set anew. */
+#if defined(NSPIRE_NO_AUDIO) || defined(NSPIRE_RUNTIME_AUDIO)
+#define sound_flush_ds(channel) sound_flush_pops(&direct_sound_channel[channel])
+#else
+#define sound_flush_ds(channel)
+#endif
+
 #define adjust_sound_buffer(timer_number, channel)                            \
   if(timer[timer_number].direct_sound_channels & (0x01 << channel))           \
   {                                                                           \
+    sound_flush_ds(channel);                                                  \
     direct_sound_channel[channel].buffer_index =                              \
      (gbc_sound_buffer_index + buffer_adjust) % BUFFER_SIZE;                  \
   }                                                                           \
@@ -322,6 +268,31 @@ static void trigger_timer(u32 timer_number, u32 value)
             adjust_sound_buffer(timer_number, 0);
             adjust_sound_buffer(timer_number, 1);
          }
+      }
+      else
+      {
+         /* Running already: the count goes on, but count-up, the prescaler
+          * and the IRQ change now, as on the GBA. Fire Emblem's link writes
+          * TM3CNT as 32 bits (count-up on), then 0xC3 (prescaler 1024): a
+          * timer left counting up never ends, and its cable stops. */
+         u32 prescale = prescale_table[value & 0x03];
+
+         timer[timer_number].status = ((value >> 2) & 0x01) ? TIMER_CASCADE : TIMER_PRESCALE;
+         timer[timer_number].irq = ((value >> 6) & 0x1);
+         if(prescale != timer[timer_number].prescale)
+         {
+            timer[timer_number].count =
+               (timer[timer_number].count >> timer[timer_number].prescale) << prescale;
+            timer[timer_number].prescale = prescale;
+            if(timer_number < 2)
+            {
+               u32 timer_reload = timer[timer_number].reload << prescale;
+               sound_update_frequency_step(timer_number);
+            }
+         }
+         if(timer[timer_number].status == TIMER_PRESCALE &&
+            (u32)timer[timer_number].count < execute_cycles)
+            execute_cycles = timer[timer_number].count;
       }
    }
    else
@@ -402,6 +373,8 @@ const u32 def_seq_cycles[16][2] =
 u8 bios_rom[1024 * 16];
 
 // Up to 128kb, store SRAM, flash ROM, or EEPROM here.
+// (NSPIRE_LIBRETRO: every write to it must call nspire_backup_mark_dirty();
+// leaving a game writes the save file only after one, nspire_backup.c.)
 u8 gamepak_backup[1024 * 128];
 
 u32 dma_bus_val;
@@ -444,6 +417,71 @@ u32 gamepak_sticky_bit[1024/32];
 // pages from, so there's no slowdown with opening and closing the file
 // a lot.
 RFILE *gamepak_file_large = NULL;
+#ifdef NSPIRE_LIBRETRO
+/* Set when the ROM file is a compressed one (nspire_gbz.h). */
+static gbz_rom *gamepak_gbz = NULL;
+/* Called while a ROM loads, with how much of it is in memory (the loading
+ * screen); and why the last load failed, if it can say. */
+/* Called after each 1 MB of the ROM; returns nonzero to stop the load (the
+ * player cancelled): load_gamepak then fails with nspire_rom_load_cancelled
+ * set, and nothing of the ROM stays mapped. */
+int (*nspire_rom_progress)(u32 done, u32 total) = NULL;
+int nspire_rom_load_cancelled = 0;
+/* Called after each 128 KB of the ROM, between the progress calls: nonzero
+ * stops the load as above (the keys are read this often so a quick press
+ * isn't missed). */
+int (*nspire_rom_poll)(void) = NULL;
+int (*nspire_rom_prepare_saves)(void) = NULL;
+#define ROM_PIECE (128 * 1024)
+const char *nspire_rom_load_error = NULL;
+/* A .gbz page that wouldn't read or unpack while the game ran: set by the
+ * page swap, read by the frontend after the frame (ZIP-2). */
+u32 nspire_rom_page_damaged = 0;
+/* A zip that didn't fit: the MB its ROM needs and the MB gpSP could have
+ * (its ROM buffer and what more it could take), else 0. The frontend then
+ * makes a .gbz of it (nspire_loading.c). */
+u32 nspire_rom_load_need_mb = 0;
+u32 nspire_rom_load_free_mb = 0;
+static char rom_load_error_text[200];
+/* Between a number and its unit in the messages, so that the loading
+ * screen doesn't wrap "4 MB" over two lines (nspire_ui.h's UI_NBSP). */
+#define NBSP "\xa0"
+#endif
+
+/* Reads 32 KB ROM page 'page' into dst, from the ROM file. */
+static void read_gamepak_file_page(u32 page, u8 *dst)
+{
+#ifdef NSPIRE_LIBRETRO
+  if (gamepak_gbz)
+  {
+    /* A page that doesn't read or unpack comes back as 0xFF: the game goes
+     * on, and the frontend stops it after the frame (ZIP-2). */
+    if (gbz_read_page(gamepak_gbz, page, dst) != 0)
+      nspire_rom_page_damaged = 1;
+    return;
+  }
+  /* A zipped game is all in memory: no pages to read (never happens). */
+  if (!gamepak_file_large)
+  {
+    memset(dst, 0xFF, 32 * 1024);
+    return;
+  }
+#endif
+  filestream_seek(gamepak_file_large, page * (32 * 1024), SEEK_SET);
+#ifdef NSPIRE_LIBRETRO
+  {
+    /* A last page cut short by the file's end, or a failed read, is zeros
+     * (as the .gbz's and the zip's are), not what the buffer held (ZIP-1). */
+    int64_t got = filestream_read(gamepak_file_large, dst, (32 * 1024));
+    if (got < 0)
+      got = 0;
+    if (got < 32 * 1024)
+      memset(dst + got, 0, 32 * 1024 - (size_t)got);
+  }
+#else
+  filestream_read(gamepak_file_large, dst, (32 * 1024));
+#endif
+}
 
 // Writes to these respective locations should trigger an update
 // so the related subsystem may react to it.
@@ -602,6 +640,9 @@ void function_cc write_eeprom(u32 unused_address, u32 value)
         {
           eeprom_mode = EEPROM_WRITE_MODE;
           memset(gamepak_backup + eeprom_address, 0, 8);
+#ifdef NSPIRE_LIBRETRO
+          nspire_backup_mark_dirty();
+#endif
         }
       }
       break;
@@ -878,10 +919,23 @@ static inline s32 signext28(u32 value)
   return ret >> 4;
 }
 
+/* Pinned in a 4 KB cache way (common.h NSPIRE_LINEIO, nspire_lineio.ld). */
+NSPIRE_LINEIO(write_io_register16)
 cpu_alert_type function_cc write_io_register16(u32 address, u32 value)
 {
   uint32_t ioreg = ((address & 0xffffff) >> 1);
   value &= 0xffff;
+#ifdef NSPIRE_BUILD
+  // Display registers (not DISPSTAT/VCOUNT): lines waiting to be drawn
+  // first (video.h)
+  if (ioreg < 0x2C && (ioreg - REG_DISPSTAT) > 1 && nspire_lines_waiting)
+  {
+    if (nspire_line_reg(ioreg))
+      nspire_video_write_line_regs();
+    else
+      nspire_flush_lines();
+  }
+#endif
   switch(ioreg)
   {
     case REG_DISPCNT:
@@ -1178,6 +1232,9 @@ void function_cc write_backup(u32 address, u32 value)
           if(flash_mode == FLASH_ERASE_MODE)
           {
             memset(gamepak_backup, 0xFF, 1024 * 128);
+#ifdef NSPIRE_LIBRETRO
+            nspire_backup_mark_dirty();
+#endif
             flash_mode = FLASH_BASE_MODE;
           }
           break;
@@ -1188,7 +1245,12 @@ void function_cc write_backup(u32 address, u32 value)
       flash_command_position = 0;
     }
     if(backup_type == BACKUP_SRAM)
+    {
       gamepak_backup[0x5555] = value;
+#ifdef NSPIRE_LIBRETRO
+      nspire_backup_mark_dirty();
+#endif
+    }
   }
   else
 
@@ -1203,6 +1265,9 @@ void function_cc write_backup(u32 address, u32 value)
       // Erase sector
       u32 fulladdr = (address & 0xF000) + 64*1024*flash_bank_num;
       memset(&gamepak_backup[fulladdr], 0xFF, 1024 * 4);
+#ifdef NSPIRE_LIBRETRO
+      nspire_backup_mark_dirty();
+#endif
       flash_mode = FLASH_BASE_MODE;
       flash_command_position = 0;
     }
@@ -1222,6 +1287,9 @@ void function_cc write_backup(u32 address, u32 value)
       // Write value to flash ROM
       u32 fulladdr = address + 64*1024*flash_bank_num;
       gamepak_backup[fulladdr] = value;
+#ifdef NSPIRE_LIBRETRO
+      nspire_backup_mark_dirty();
+#endif
       flash_mode = FLASH_BASE_MODE;
     }
     else
@@ -1230,11 +1298,11 @@ void function_cc write_backup(u32 address, u32 value)
     {
       // Write value to SRAM
       gamepak_backup[address] = value;
+#ifdef NSPIRE_LIBRETRO
+      nspire_backup_mark_dirty();
+#endif
     }
   }
-#ifdef NSPIRE_LIBRETRO
-  nspire_backup_mark_dirty();
-#endif
 }
 
 #define write_backup8()                                                       \
@@ -1355,6 +1423,9 @@ static void write_rtc(u8 old, u8 new)
       if (++rtc_bit_count == 8) {
         switch (rtc_command) {
         case RTC_COMMAND_RESET:
+          rtc_status = 0x40;
+          rtc_state = RTC_IDLE;
+          break;
         case RTC_COMMAND_WRITE_STATUS:
           rtc_state = RTC_INPUT_DATA;
           rtc_data = 0;
@@ -1404,8 +1475,8 @@ static void write_rtc(u8 old, u8 new)
       break;
 
     case RTC_INPUT_DATA:
-      rtc_data <<= 1;
-      rtc_data |= ((new >> 1) & 1);
+      rtc_data >>= 1;
+      rtc_data |= (((new >> 1) & 1) << 7);
       rtc_data_bits--;
       if (!rtc_data_bits) {
         rtc_status = rtc_data; // HACK: assuming write status here.
@@ -1490,6 +1561,14 @@ void function_cc write_gpio(u32 address, u32 value) {
 
 #define write_gpio32()                                                        \
 
+#ifdef NSPIRE_BUILD
+/* (speed10: a C store into palette RAM or VRAM, a cheat's, counts as a
+ * change: nspire_reuse.c) */
+#define nspire_video_write_c() do { nspire_video_write(); nspire_video_gen++; } while (0)
+#else
+#define nspire_video_write_c()
+#endif
+
 #define write_memory(type)                                                    \
   switch(address >> 24)                                                       \
   {                                                                           \
@@ -1509,11 +1588,13 @@ void function_cc write_gpio(u32 address, u32 value) {
                                                                               \
     case 0x05:                                                                \
       /* palette RAM */                                                       \
+      nspire_video_write_c();                                                 \
       write_palette##type(address & 0x3FF, value);                            \
       break;                                                                  \
                                                                               \
     case 0x06:                                                                \
       /* VRAM */                                                              \
+      nspire_video_write_c();                                                 \
       address &= 0x1FFFF;                                                     \
       if(address >= 0x18000)                                                  \
         address -= 0x8000;                                                    \
@@ -1523,6 +1604,7 @@ void function_cc write_gpio(u32 address, u32 value) {
                                                                               \
     case 0x07:                                                                \
       /* OAM RAM */                                                           \
+      nspire_video_write_c();                                                 \
       if (type != 8) {                                                        \
         reg[OAM_UPDATED] = 1;                                                 \
         address##type(oam_ram, address & 0x3FF) = eswap##type(value);         \
@@ -2138,6 +2220,8 @@ static cpu_alert_type dma_transfer_copy(
   return CPU_ALERT_NONE;
 }
 
+/* Pinned in a 4 KB cache way (common.h NSPIRE_LINEIO, nspire_lineio.ld). */
+NSPIRE_LINEIO(dma_transfer)
 cpu_alert_type dma_transfer(unsigned dma_chan, int *usedcycles)
 {
   dma_transfer_type *dmach = &dma[dma_chan];
@@ -2158,6 +2242,31 @@ cpu_alert_type dma_transfer(unsigned dma_chan, int *usedcycles)
   dma_region_type src_reg1 = dma_region_map[src_end >> 24];
   dma_region_type dst_reg0 = dma_region_map[dst_ptr >> 24];
   dma_region_type dst_reg1 = dma_region_map[dst_end >> 24];
+
+#ifdef NSPIRE_BUILD
+  // Into palette, VRAM, OAM or the display registers (not the sound FIFOs):
+  // lines waiting to be drawn first (video.h)
+  // (Only into the windows, mosaic and blending registers, e.g. a window
+  // set every line by HBlank DMA: the waiting lines keep the old values.)
+  if (nspire_lines_waiting &&
+      ((dst_ptr >> 24) - 5 < 3 || (dst_end >> 24) - 5 < 3 ||
+       ((dst_ptr >> 24) == 4 && (dst_ptr & 0xFFFFFF) < 0x58) ||
+       ((dst_end >> 24) == 4 && (dst_end & 0xFFFFFF) < 0x58)))
+  {
+    if ((dst_ptr >> 24) == 4 && (dst_end >> 24) == 4 && (dst_ptr & 0xFFFFFF) >= 0x40 &&
+        (dst_end & 0xFFFFFF) <= 0x58 && dst_end >= dst_ptr &&
+        dma_stride[dmach->dest_direction] >= 0)
+      nspire_video_write_line_regs();
+    else
+      nspire_flush_lines();
+  }
+#endif
+
+#ifdef NSPIRE_BUILD
+  // speed10: whether it changes a value in palette RAM or VRAM (nspire_reuse.c)
+  if (__builtin_expect((u32)dst_reg0 - DMA_REGION_VRAM < 2 || (u32)dst_reg1 - DMA_REGION_VRAM < 2, 0))
+    nspire_video_dma(dmach, src_ptr, dst_ptr, byte_length);
+#endif
 
   if (src_reg0 == src_reg1 && dst_reg0 == dst_reg1)
     ret = dma_transfer_copy(dmach, src_ptr, dst_ptr, byte_length >> tfsizes);
@@ -2200,6 +2309,113 @@ cpu_alert_type dma_transfer(unsigned dma_chan, int *usedcycles)
        def_seq_cycles[src_ptr >> 24][tfsizes - 1] +
        def_seq_cycles[dst_ptr >> 24][tfsizes - 1]);
 
+  return ret;
+}
+
+/* core-06: a sound FIFO refill (sound_timer, about 28 a frame) without
+ * dma_transfer's general machinery: 4 words from EWRAM, IWRAM or a ROM page
+ * already in memory into FIFO A or B. Every other case goes to dma_transfer.
+ * Same FIFO bytes, source/dest address, dma_bus_val, CNT_H, IF and cycles as
+ * dma_transfer (tests/host/core_tests.c test_sound_fifo_dma compares them).
+ * Not hot and not inlined into the hot sound_timer: the hot stretch keeps
+ * its size and the stubs their place. */
+__attribute__((noinline))
+cpu_alert_type dma_sound_fifo(unsigned dma_chan, int *usedcycles)
+{
+  dma_transfer_type *dmach = &dma[dma_chan];
+  u32 src0 = 0x0FFFFFFF & dmach->source_address & ~3U;
+  u32 dst_ptr = 0x0FFFFFFF & dmach->dest_address & ~3U;
+  u32 src_dir = dmach->source_direction;
+  u32 src, i, top, mask, words[4];
+  int stride;
+  cpu_alert_type ret = CPU_ALERT_NONE;
+  dma_region_type region;
+  const u8 *base;
+  direct_sound_struct *ds;
+
+  if (dmach->start_type != DMA_START_SPECIAL || dmach->length_type != DMA_32BIT ||
+      dmach->length != 4 || dmach->dest_direction != DMA_FIXED ||
+      (dst_ptr != 0x40000A0 && dst_ptr != 0x40000A4) ||
+      (src_dir != DMA_INCREMENT && src_dir != DMA_FIXED))
+    return dma_transfer(dma_chan, usedcycles);
+
+  stride = src_dir == DMA_INCREMENT ? 4 : 0;
+  region = dma_region_map[src0 >> 24];
+  /* dma_transfer's region test: src0 + 16 * stride, capped at 0x10000000 */
+  if (region != dma_region_map[MIN(0x10000000, src0 + 4 * stride) >> 24])
+    return dma_transfer(dma_chan, usedcycles);
+  if (region == DMA_REGION_GAMEPAK)
+  {
+    /* one 32 KB page, already in memory (else load_gamepak_page's path) */
+    if (stride && (src0 & 0x7FFF) > 0x7FF0)
+      return dma_transfer(dma_chan, usedcycles);
+    base = memory_map_read[src0 >> 15];
+    if (base == NULL)
+      return dma_transfer(dma_chan, usedcycles);
+    mask = 0x7FFF;
+  }
+  else if (region == DMA_REGION_EWRAM)
+  {
+    base = ewram;            /* dma_read_ewram */
+    mask = 0x3FFFF;
+  }
+  else if (region == DMA_REGION_IWRAM)
+  {
+    base = iwram + 0x8000;   /* dma_read_iwram */
+    mask = 0x7FFF;
+  }
+  else
+    return dma_transfer(dma_chan, usedcycles);
+
+  /* (a state's fifo_top over 31: sound_timer_queue32's first byte goes
+   * past the FIFO; left to it, exactly as before) */
+  ds = &direct_sound_channel[dst_ptr == 0x40000A4 ? 1 : 0];
+  top = ds->fifo_top;
+  if (top > 31)
+    return dma_transfer(dma_chan, usedcycles);
+
+  /* the words in order, each address masked as the generic loop does
+   * (a ROM page's 4 words never cross its end, checked above) */
+  src = src0;
+  for (i = 0; i < 4; i++)
+  {
+    words[i] = readaddress32(base, src & mask);
+    src += stride;
+  }
+
+  /* sound_timer_queue32 four times: 16 bytes from fifo_top on, mod 32 */
+  if ((top & 3) == 0)
+  {
+    /* the usual case: 4 aligned words (fifo is at offset 0 of a u32 struct;
+     * a word's bytes go low first, as sound_timer_queue32's do) */
+    for (i = 0; i < 4; i++)
+      {
+      u32 word = eswap32(words[i]);
+      memcpy(ds->fifo + ((top + 4 * i) & 31), &word, sizeof(word));
+    }
+  }
+  else
+  {
+    for (i = 0; i < 16; i++)
+      ds->fifo[(top + i) & 31] = (u8)(words[i >> 2] >> (8 * (i & 3)));
+  }
+  ds->fifo_top = (top + 16) & 31;
+
+  dma_bus_val = words[3];
+  dmach->source_address = src;
+  dmach->dest_address = dst_ptr;   /* dma_tf_loop32's write-back (fixed dest) */
+
+  /* dma_transfer's tail (start_type is DMA_START_SPECIAL here) */
+  if (dmach->repeat_type == DMA_NO_REPEAT)
+  {
+    u32 cntrl = read_dmareg(REG_DMA0CNT_H, dma_chan);
+    write_dmareg(REG_DMA0CNT_H, dma_chan, cntrl & (~0x8000));
+    dmach->start_type = DMA_INACTIVE;
+  }
+  if (dmach->irq)
+    ret |= flag_interrupt(IRQ_DMA0 << dma_chan);
+  if (usedcycles)
+    *usedcycles += 4 * (def_seq_cycles[src0 >> 24][1] + def_seq_cycles[4][1]);
   return ret;
 }
 
@@ -2283,14 +2499,13 @@ u8 *load_gamepak_page(u32 physical_index)
   // Fill in the entry
   gamepak_blk_queue[entry].phy_rom = physical_index;
 
-  filestream_seek(gamepak_file_large, physical_index * (32 * 1024), SEEK_SET);
-  filestream_read(gamepak_file_large, swap_location, (32 * 1024));
+  read_gamepak_file_page(physical_index, swap_location);
 
   // Map it to the read handlers now
   map_rom_entry(read, physical_index, swap_location, gamepak_size >> 15);
 
-  // When mapping page 0, we might need to reflect the GPIO regs.
-  if (physical_index == 0)
+  // When mapping page 0, reflect active GPIO regs over the ROM header.
+  if (physical_index == 0 && gpio_regs[2])
     update_gpio_romregs();
 
   return swap_location;
@@ -2398,13 +2613,23 @@ void init_memory(void)
 
   flash_mode = FLASH_BASE_MODE;
 
-  rtc_state = RTC_DISABLED;
-  memset(gpio_regs, 0, sizeof(gpio_regs));
+  {
+    u8 had_gpio = gpio_regs[2];
+    rtc_state = RTC_DISABLED;
+    rtc_status = 0x40;
+    memset(gpio_regs, 0, sizeof(gpio_regs));
+    if (had_gpio)
+      update_gpio_romregs();
+  }
   reg[REG_BUS_VALUE] = 0xe129f000;
 }
 
 void memory_term(void)
 {
+#ifdef NSPIRE_LIBRETRO
+  gbz_close(gamepak_gbz);
+  gamepak_gbz = NULL;
+#endif
   if (gamepak_file_large)
   {
     filestream_close(gamepak_file_large);
@@ -2428,20 +2653,21 @@ bool memory_check_savestate(const u8 *src)
     "src-addr", "dst-addr", "src-dir", "dst-dir",
     "len", "size", "repeat", "start", "dsc", "irq"
   };
-  int i;
-  const u8 *memdoc = bson_find_key(src, "memory");
-  const u8 *bakdoc = bson_find_key(src, "backup");
-  const u8 *dmadoc = bson_find_key(src, "dma");
+  int i, j;
+  u32 value, mode, counter, address, eesize;
+  const u8 *memdoc = bson_find_document(src, "memory");
+  const u8 *bakdoc = bson_find_document(src, "backup");
+  const u8 *dmadoc = bson_find_document(src, "dma");
   if (!memdoc || !bakdoc || !dmadoc)
     return false;
 
-  // Check memory buffers (TODO: check sizes!)
-  if (!bson_contains_key(memdoc, "iwram", BSON_TYPE_BIN) ||
-      !bson_contains_key(memdoc, "ewram", BSON_TYPE_BIN) ||
-      !bson_contains_key(memdoc, "vram", BSON_TYPE_BIN) ||
-      !bson_contains_key(memdoc, "oamram", BSON_TYPE_BIN) ||
-      !bson_contains_key(memdoc, "palram", BSON_TYPE_BIN) ||
-      !bson_contains_key(memdoc, "ioregs", BSON_TYPE_BIN) ||
+  // Check every size before any reader copies into the running machine.
+  if (!bson_check_bytes(memdoc, "iwram", 0x8000) ||
+      !bson_check_bytes(memdoc, "ewram", 0x40000) ||
+      !bson_check_bytes(memdoc, "vram", sizeof(vram)) ||
+      !bson_check_bytes(memdoc, "oamram", sizeof(oam_ram)) ||
+      !bson_check_bytes(memdoc, "palram", sizeof(palette_ram)) ||
+      !bson_check_bytes(memdoc, "ioregs", sizeof(io_registers)) ||
       !bson_contains_key(memdoc, "dma-bus", BSON_TYPE_INT32))
      return false;
 
@@ -2450,20 +2676,54 @@ bool memory_check_savestate(const u8 *src)
     if (!bson_contains_key(bakdoc, vars32[i], BSON_TYPE_INT32))
       return false;
 
-  if (!bson_contains_key(bakdoc, "gpio-regs", BSON_TYPE_BIN) ||
-      !bson_contains_key(bakdoc, "rtc-data-words", BSON_TYPE_ARR))
+  if (!bson_check_bytes(bakdoc, "gpio-regs", sizeof(gpio_regs)) ||
+      !bson_check_int32_array(bakdoc, "rtc-data-words", 2))
       return false;
+
+  /* These fields become array offsets, bit shifts or DMA dispatch values.
+   * Bound them while the old state is still intact. */
+  if (!bson_read_int32(bakdoc, "backup-type", &value) || value > BACKUP_UNKN ||
+      !bson_read_int32(bakdoc, "flash-bank-num", &value) || value > 1 ||
+      !bson_read_int32(bakdoc, "flash-size", &value) || value > FLASH_SIZE_128KB ||
+      !bson_read_int32(bakdoc, "eeprom-size", &eesize) ||
+      (eesize != EEPROM_512_BYTE && eesize != EEPROM_8_KBYTE) ||
+      !bson_read_int32(bakdoc, "eeprom-mode", &mode) || mode > EEPROM_WRITE_FOOTER_MODE ||
+      !bson_read_int32(bakdoc, "eeprom-counter", &counter) || counter > 63 ||
+      !bson_read_int32(bakdoc, "eeprom-addr", &address) || address >= sizeof(gamepak_backup))
+    return false;
+  if ((mode == EEPROM_BASE_MODE && counter > 1) ||
+      (mode == EEPROM_READ_HEADER_MODE && counter > 3) ||
+      ((mode == EEPROM_ADDRESS_MODE || mode == EEPROM_WRITE_ADDRESS_MODE) &&
+       (address > 0xffff || counter >= (eesize == EEPROM_512_BYTE ? 6u : 14u))) ||
+      ((mode != EEPROM_BASE_MODE && mode != EEPROM_ADDRESS_MODE && mode != EEPROM_WRITE_ADDRESS_MODE) &&
+       address > sizeof(gamepak_backup) - 8))
+    return false;
+  {
+    const u8 *io = bson_find_key(memdoc, "ioregs") + 5;
+    unsigned line = io[REG_VCOUNT * 2] | (io[REG_VCOUNT * 2 + 1] << 8);
+    if (line >= 228)
+      return false;
+  }
 
   for (i = 0; i < DMA_CHAN_CNT; i++)
   {
     char tname[2] = {'0' + i, 0};
-    const u8 *dmastr = bson_find_key(dmadoc, tname);
+    const u8 *dmastr = bson_find_document(dmadoc, tname);
     if (!dmastr)
       return false;
 
-    for (i = 0; i < sizeof(dmavars32)/sizeof(dmavars32[0]); i++)
-      if (!bson_contains_key(dmastr, dmavars32[i], BSON_TYPE_INT32))
+    for (j = 0; j < sizeof(dmavars32)/sizeof(dmavars32[0]); j++)
+      if (!bson_contains_key(dmastr, dmavars32[j], BSON_TYPE_INT32))
         return false;
+    if (!bson_read_int32(dmastr, "src-dir", &value) || value > DMA_RELOAD ||
+        !bson_read_int32(dmastr, "dst-dir", &value) || value > DMA_RELOAD ||
+        !bson_read_int32(dmastr, "len", &value) || value > 0x10000 ||
+        !bson_read_int32(dmastr, "size", &value) || value > DMA_32BIT ||
+        !bson_read_int32(dmastr, "repeat", &value) || value > DMA_REPEAT ||
+        !bson_read_int32(dmastr, "start", &value) || value > DMA_INACTIVE ||
+        !bson_read_int32(dmastr, "dsc", &value) || value > DMA_NO_DIRECT_SOUND ||
+        !bson_read_int32(dmastr, "irq", &value) || value > DMA_TRIGGER_IRQ)
+      return false;
   }
   return true;
 }
@@ -2473,6 +2733,7 @@ bool memory_read_savestate(const u8 *src)
 {
   int i;
   u32 rtc_data_array[2];
+  u8 prev_gpio_en = gpio_regs[2];
   const u8 *memdoc = bson_find_key(src, "memory");
   const u8 *bakdoc = bson_find_key(src, "backup");
   const u8 *dmadoc = bson_find_key(src, "dma");
@@ -2531,6 +2792,11 @@ bool memory_read_savestate(const u8 *src)
   }
 
   rtc_data = rtc_data_array[0] | (((u64)rtc_data_array[1]) << 32);
+  if (rtc_status == 0x02)
+    rtc_status = 0x40;
+  if (prev_gpio_en || gpio_regs[2])
+    update_gpio_romregs();
+  reload_timing_info();
 
   return true;
 }
@@ -2597,10 +2863,189 @@ unsigned memory_write_savestate(u8 *dst)
   return (unsigned int)(dst - startp);
 }
 
+#ifdef NSPIRE_LIBRETRO
+/* Forgets which ROM pages are where, for a new ROM. */
+static void reset_gamepak_pages(void)
+{
+  unsigned i;
+  u32 active_entries = gamepak_buffer_count * 32;
+
+  for (i = 0; i < 1024; i++)
+  {
+    gamepak_blk_queue[i].next_lru = (u16)(i + 1);
+    gamepak_blk_queue[i].phy_rom = -1;
+  }
+  gamepak_lru_head = 0;
+  gamepak_lru_tail = (active_entries > 0) ? (active_entries - 1) : 0;
+  clear_gamepak_stickybits();
+}
+
+/* A game's optional ROM cache must not crowd out its ability to save.
+ * Only called at a game boundary, before any new ROM pages are mapped:
+ * live interpreter/dynarec pointers must never be evicted this way.
+ * Local raw/GBZ files can page with one block; ZIP/USB games must retain
+ * their whole ROM. The user's configured cache size is left unchanged. */
+static void gamepak_make_save_room(u32 required)
+{
+  u32 before = gamepak_buffer_count;
+  if (!nspire_rom_prepare_saves)
+    return;
+  /* All three ROM mirrors, including the upper half of the third one
+   * used by a previous 32 MB game. Freed ROM bytes may become save buffers. */
+  map_null(read, 0x8000000, 0xE000000);
+  while (!nspire_rom_prepare_saves() && gamepak_buffer_count > required)
+  {
+    free(gamepak_buffers[--gamepak_buffer_count]);
+    gamepak_buffers[gamepak_buffer_count] = NULL;
+  }
+  reset_gamepak_pages();
+  if (before != gamepak_buffer_count)
+    states_timing_note("Save memory: ROM cache reduced from %u to %u MB before loading (setting %u MB)",
+                      (unsigned)before, (unsigned)gamepak_buffer_count,
+                      (unsigned)nspire_rom_buffer_size_choice);
+}
+
+/* The ROM manager is about to replace the running game's file
+ * (nspire_rom_manager.c). The file can go when the whole ROM is in memory:
+ * it's closed then, as nothing reads it any more. 0 when the game still
+ * reads pages of it. */
+int nspire_rom_file_release(void)
+{
+  if (gamepak_must_swap())
+    return 0;
+  gbz_close(gamepak_gbz);
+  gamepak_gbz = NULL;
+  if (gamepak_file_large)
+  {
+    filestream_close(gamepak_file_large);
+    gamepak_file_large = NULL;
+  }
+  return 1;
+}
+
+/* A zipped game (nspire_zip.h): unpacked into memory whole, as a deflated
+ * file can only be read from its start. When the ROM buffer is smaller
+ * than the ROM, more of it is taken for this game, if memory allows. */
+static s32 load_gamepak_zip(const char *name)
+{
+  zip_rom *zip = zip_open(name);
+  u32 size, blocks, rom_blocks, i, j, had = gamepak_buffer_count;
+
+  if (!zip)
+  {
+    nspire_rom_load_error = "No GBA ROM in this zip, or it's damaged.";
+    return -1;
+  }
+  size = zip_size(zip);
+  blocks = (size + gamepak_buffer_blocksize - 1) / gamepak_buffer_blocksize;
+  while (gamepak_buffer_count < blocks && gamepak_buffer_count < 32)
+  {
+    void *ptr = malloc(gamepak_buffer_blocksize);
+    if (!ptr)
+      break;
+    gamepak_buffers[gamepak_buffer_count++] = (u8 *)ptr;
+  }
+  if (gamepak_buffer_count < blocks)
+  {
+    nspire_rom_load_need_mb = blocks;
+    nspire_rom_load_free_mb = gamepak_buffer_count;
+    snprintf(rom_load_error_text, sizeof(rom_load_error_text),
+             "Not enough memory to unpack this zip: it needs %u" NBSP "MB, %u" NBSP "MB is free. "
+             "Close open documents, or make a .gbz of it (System > Manage games): it needs less.",
+             (unsigned)blocks, (unsigned)gamepak_buffer_count);
+    nspire_rom_load_error = rom_load_error_text;
+    /* The blocks just taken for it go back: memory is short, and making a
+     * .gbz of the zip needs some. They were never mapped. */
+    while (gamepak_buffer_count > had)
+      free(gamepak_buffers[--gamepak_buffer_count]);
+    zip_close(zip);
+    return -1;
+  }
+
+  gamepak_make_save_room(blocks);
+  reset_gamepak_pages();
+  gamepak_size = (size + 0x7FFF) & ~0x7FFF;
+  rom_blocks = gamepak_size >> 15;
+  map_null(read, 0x8000000, 0xD000000);
+  for (i = 0; i < blocks; i++)
+  {
+    u32 n = size - i * gamepak_buffer_blocksize;
+    if (n > gamepak_buffer_blocksize)
+      n = gamepak_buffer_blocksize;
+    {
+      u32 off;
+      int bad = 0;
+      for (off = 0; off < n && !bad; off += ROM_PIECE)
+      {
+        bad = zip_read(zip, gamepak_buffers[i] + off, n - off < ROM_PIECE ? n - off : ROM_PIECE) != 0;
+        if (!bad && nspire_rom_poll && nspire_rom_poll())
+        {
+          nspire_rom_load_cancelled = 1;
+          zip_close(zip);
+          map_null(read, 0x8000000, 0xD000000);
+          reset_gamepak_pages();
+          gamepak_size = 0;
+          return -1;
+        }
+      }
+      if (bad)
+        break;
+    }
+    /* The last page's end past the ROM, as the file reads would leave it. */
+    memset(gamepak_buffers[i] + n, 0, ((n + 0x7FFF) & ~0x7FFF) - n);
+    for (j = 0; j < 32 && i * 32 + j < rom_blocks; j++)
+    {
+      u32 phyn = i * 32 + j;
+      u32 entry = evict_gamepak_page();
+      gamepak_blk_queue[entry].phy_rom = phyn;
+      map_rom_entry(read, phyn, &gamepak_buffers[i][32 * 1024 * j], rom_blocks);
+    }
+    if (nspire_rom_progress && nspire_rom_progress(i + 1, blocks))
+    {
+      nspire_rom_load_cancelled = 1;
+      zip_close(zip);
+      map_null(read, 0x8000000, 0xD000000);
+      reset_gamepak_pages();
+      gamepak_size = 0;
+      return -1;
+    }
+  }
+  if (zip_check(zip))
+  {
+    nspire_rom_load_error = "This zip is damaged: its ROM doesn't\n"
+                            "read back right.";
+    zip_close(zip);
+    map_null(read, 0x8000000, 0xD000000);
+    reset_gamepak_pages();
+    gamepak_size = 0;
+    return -1;
+  }
+  zip_close(zip);
+  return 0;
+}
+#endif
+
 static s32 load_gamepak_raw(const char *name)
 {
   unsigned i, j;
   u32 active_entries;
+#ifdef NSPIRE_LIBRETRO
+  gbz_close(gamepak_gbz);
+  gamepak_gbz = NULL;
+  nspire_rom_load_error = NULL;
+  nspire_rom_page_damaged = 0;
+  nspire_rom_load_need_mb = nspire_rom_load_free_mb = 0;
+  nspire_rom_load_cancelled = 0;
+  if (zip_is_zip(name))
+  {
+    if (gamepak_file_large)
+    {
+      filestream_close(gamepak_file_large);
+      gamepak_file_large = NULL;
+    }
+    return load_gamepak_zip(name);
+  }
+#endif
   if (gamepak_file_large)
   {
     filestream_close(gamepak_file_large);
@@ -2610,6 +3055,21 @@ static s32 load_gamepak_raw(const char *name)
                                        RETRO_VFS_FILE_ACCESS_HINT_NONE);
   if(gamepak_file_large)
   {
+#ifdef NSPIRE_LIBRETRO
+    if (gbz_is_gbz(gamepak_file_large))
+    {
+      gamepak_gbz = gbz_open(gamepak_file_large);
+      if (!gamepak_gbz)
+      {
+        nspire_rom_load_error = "This .gbz is damaged, or there isn't the memory for its "
+                                "page table (8" NBSP "KB for a 32" NBSP "MB game). Close open documents "
+                                "and try again.";
+        filestream_close(gamepak_file_large);
+        gamepak_file_large = NULL;
+        return -1;
+      }
+    }
+#endif
     /* New ROM load: drop previous game's page-cache/LRU metadata.
      * Keeping stale phy_rom indices across ROM-size changes can cause
      * map_rom_entry() to unmap using out-of-range indices later. */
@@ -2623,19 +3083,86 @@ static s32 load_gamepak_raw(const char *name)
     gamepak_lru_tail = (active_entries > 0) ? (active_entries - 1) : 0;
     clear_gamepak_stickybits();
 
+#ifdef NSPIRE_LIBRETRO
+    u32 raw_bytes = 0;
+#endif
     // Round size to 32KB pages
     gamepak_size = (u32)filestream_get_size(gamepak_file_large);
+#ifdef NSPIRE_LIBRETRO
+    if (gamepak_gbz)
+      gamepak_size = gbz_rom_size(gamepak_gbz);
+    /* An empty or cut-short copy, or a file no GBA game is (ZIP-1): a ROM is
+     * at least its 192-byte header and at most 32 MB. */
+    {
+      int64_t file_bytes = gamepak_gbz ? (int64_t)gamepak_size : filestream_get_size(gamepak_file_large);
+      if (file_bytes < 192 || file_bytes > 32 * 1024 * 1024)
+      {
+        nspire_rom_load_error = file_bytes < 192 ?
+            "This file is empty or too short to be a GBA game. A copy that was cut off?" :
+            "This file is over 32" NBSP "MB: too big for a GBA game.";
+        gbz_close(gamepak_gbz);
+        gamepak_gbz = NULL;
+        filestream_close(gamepak_file_large);
+        gamepak_file_large = NULL;
+        gamepak_size = 0;
+        return -1;
+      }
+    }
+    raw_bytes = gamepak_size;
+#endif
     gamepak_size = (gamepak_size + 0x7FFF) & ~0x7FFF;
 
     // Load stuff in 1MB chunks
     u32 buf_blocks = (gamepak_size + gamepak_buffer_blocksize-1) / (gamepak_buffer_blocksize);
     u32 rom_blocks = gamepak_size >> 15;
+#ifdef NSPIRE_LIBRETRO
+    /* A removable drive is never the game's page cache. Keep every page
+     * in RAM before play; its handle is closed on successful loading. */
+    if (!strncmp(name, "usb:/", 5))
+    {
+      u32 had = gamepak_buffer_count;
+      while (gamepak_buffer_count < buf_blocks && gamepak_buffer_count < 32)
+      {
+        void *ptr = malloc(gamepak_buffer_blocksize);
+        if (!ptr) break;
+        gamepak_buffers[gamepak_buffer_count++] = (u8 *)ptr;
+      }
+      if (gamepak_buffer_count < buf_blocks)
+      {
+        nspire_rom_load_need_mb = buf_blocks;
+        nspire_rom_load_free_mb = gamepak_buffer_count;
+        snprintf(rom_load_error_text, sizeof(rom_load_error_text),
+                 "This USB game needs %u" NBSP "MB in memory; %u" NBSP "MB is free. "
+                 "Close open documents, or copy it to the calculator and try again.",
+                 (unsigned)buf_blocks, (unsigned)gamepak_buffer_count);
+        nspire_rom_load_error = rom_load_error_text;
+        while (gamepak_buffer_count > had) free(gamepak_buffers[--gamepak_buffer_count]);
+        gbz_close(gamepak_gbz); gamepak_gbz = NULL;
+        filestream_close(gamepak_file_large); gamepak_file_large = NULL;
+        map_null(read, 0x8000000, 0xD000000);
+        reset_gamepak_pages();
+        gamepak_size = 0;
+        return -1;
+      }
+      reset_gamepak_pages();     /* the LRU now includes the new buffers */
+    }
+#endif
+    /* Mandatory whole-ROM growth above gets the same peak room as before.
+     * Reserve saves before mapping; only local files may page a smaller cache. */
+#ifdef NSPIRE_LIBRETRO
+    gamepak_make_save_room(!strncmp(name, "usb:/", 5) ? buf_blocks : 1);
+#endif
     u32 ldblks = buf_blocks < gamepak_buffer_count ?
                     buf_blocks : gamepak_buffer_count;
+#ifdef NSPIRE_LIBRETRO
+    int damaged = 0;
+#endif
 
 #ifdef NSPIRE_LIBRETRO
     if (ldblks == 0 && gamepak_size != 0)
     {
+      gbz_close(gamepak_gbz);
+      gamepak_gbz = NULL;
       filestream_close(gamepak_file_large);
       gamepak_file_large = NULL;
       return -1;
@@ -2649,7 +3176,62 @@ static s32 load_gamepak_raw(const char *name)
     for (i = 0; i < ldblks; i++)
     {
       // Load 1MB chunk and map it
+#ifdef NSPIRE_LIBRETRO
+      int stop = 0;
+      if (gamepak_gbz)
+      {
+        for (j = 0; j < 32 && i*32 + j < rom_blocks && !stop && !damaged; j++)
+        {
+          damaged = gbz_read_page(gamepak_gbz, i*32 + j, &gamepak_buffers[i][32 * 1024 * j]) != 0;
+          stop = (j & 3) == 3 && nspire_rom_poll && nspire_rom_poll();
+        }
+      }
+      else
+      {
+        u32 off;
+        u32 want = raw_bytes - i * gamepak_buffer_blocksize;   /* the file's bytes in this block */
+        if (want > gamepak_buffer_blocksize)
+          want = gamepak_buffer_blocksize;
+        for (off = 0; off < gamepak_buffer_blocksize && !stop && !damaged; off += ROM_PIECE)
+        {
+          u32 chunk = off >= want ? 0 : want - off < ROM_PIECE ? want - off : ROM_PIECE;
+          /* Not read, or not read whole: zeros, not what malloc left (ZIP-1). */
+          if (chunk)
+            damaged = filestream_read(gamepak_file_large, gamepak_buffers[i] + off, chunk) != (int64_t)chunk;
+          if (!damaged && chunk < ROM_PIECE)
+            memset(gamepak_buffers[i] + off + chunk, 0, ROM_PIECE - chunk);
+          stop = nspire_rom_poll && nspire_rom_poll();
+        }
+      }
+      if (damaged)
+      {
+        nspire_rom_load_error = gamepak_gbz ?
+            "This .gbz is damaged: a page of it doesn't read." :
+            "The file couldn't be read to its end. A copy that was cut off?";
+        gbz_close(gamepak_gbz);
+        gamepak_gbz = NULL;
+        filestream_close(gamepak_file_large);
+        gamepak_file_large = NULL;
+        map_null(read, 0x8000000, 0xD000000);
+        reset_gamepak_pages();
+        gamepak_size = 0;
+        return -1;
+      }
+      if (stop)
+      {
+        nspire_rom_load_cancelled = 1;
+        gbz_close(gamepak_gbz);
+        gamepak_gbz = NULL;
+        filestream_close(gamepak_file_large);
+        gamepak_file_large = NULL;
+        map_null(read, 0x8000000, 0xD000000);
+        reset_gamepak_pages();
+        gamepak_size = 0;
+        return -1;
+      }
+#else
       filestream_read(gamepak_file_large, gamepak_buffers[i], gamepak_buffer_blocksize);
+#endif
       for (j = 0; j < 32 && i*32 + j < rom_blocks; j++)
       {
         u32 phyn = i*32 + j;
@@ -2659,6 +3241,20 @@ static s32 load_gamepak_raw(const char *name)
         // Map it to the read handlers now
         map_rom_entry(read, phyn, blkptr, rom_blocks);
       }
+#ifdef NSPIRE_LIBRETRO
+      if (nspire_rom_progress && nspire_rom_progress(i + 1, ldblks))
+      {
+        nspire_rom_load_cancelled = 1;
+        gbz_close(gamepak_gbz);
+        gamepak_gbz = NULL;
+        filestream_close(gamepak_file_large);
+        gamepak_file_large = NULL;
+        map_null(read, 0x8000000, 0xD000000);
+        reset_gamepak_pages();
+        gamepak_size = 0;
+        return -1;
+      }
+#endif
     }
 
     return 0;
@@ -2676,20 +3272,34 @@ u32 load_gamepak(const struct retro_game_info* info, const char *name,
 
 #ifdef NSPIRE_LIBRETRO
    if (gamepak_buffer_count == 0)
-      return -1;
-
-   if (name)
    {
-      size_t nl = strlen(name);
-      int is_zip = (nl >= 8 && !strcasecmp(name + nl - 8, ".zip.tns"))
-                || (nl >= 4 && !strcasecmp(name + nl - 4, ".zip"));
-      if (is_zip)
-         return -1;
+      /* init_gamepak_buffer got no 1 MB block at all. */
+      nspire_rom_load_error = "Not enough memory for the game: it needs at least 1" NBSP "MB "
+                              "and less is free. Close open documents and try again.";
+      return -1;
    }
 #endif
 
+#ifdef NSPIRE_LIBRETRO
+   u32 t_start = nspire_ticks(), t_raw;
+   int raw_failed = load_gamepak_raw(name);
+   t_raw = nspire_ticks() - t_start;
+   states_timing_note("ROM load %s: %u.%u ms (open, read, inflate or convert)%s", name ? name : "?",
+                      (unsigned)(t_raw * 1000u / NSPIRE_TICK_HZ), (unsigned)(t_raw * 10000u / NSPIRE_TICK_HZ % 10),
+                      raw_failed ? " FAILED" : "");
+   if (raw_failed)
+      return -1;
+#else
    if (load_gamepak_raw(name))
       return -1;
+#endif
+#ifdef NSPIRE_LIBRETRO
+   if (name && !strncmp(name, "usb:/", 5) && !nspire_rom_file_release())
+   {
+      nspire_rom_load_error = "This USB game could not be kept in memory.";
+      return -1;
+   }
+#endif
 
    if (name)
    {

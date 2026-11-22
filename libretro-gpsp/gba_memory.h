@@ -246,12 +246,19 @@ extern u8 gamepak_maker[3];
 #endif
 
 cpu_alert_type dma_transfer(unsigned dma_chan, int *cycles);
+/* A sound FIFO refill: dma_transfer, with a short path for the usual case */
+cpu_alert_type dma_sound_fifo(unsigned dma_chan, int *cycles);
 u8 *memory_region(u32 address, u32 *memory_limit);
 u32 load_gamepak(const struct retro_game_info* info, const char *name,
                  int force_rtc, int force_rumble, int force_serial);
 s32 load_bios(char *name);
 void init_memory(void);
 void init_gamepak_buffer(void);
+#ifdef NSPIRE_LIBRETRO
+/* At a game load only: reserve the frontend's save workspace before ROM
+ * pages are mapped. NULL for standalone core users. Returns 1 if kept. */
+extern int (*nspire_rom_prepare_saves)(void);
+#endif
 bool gamepak_must_swap(void);
 void memory_term(void);
 u8 *load_gamepak_page(u32 physical_index);
@@ -317,6 +324,8 @@ extern u32 eeprom_mode;
 extern u32 eeprom_address;
 extern u32 eeprom_counter;
 
+// (NSPIRE_LIBRETRO: every write to it must call nspire_backup_mark_dirty();
+// leaving a game writes the save file only after one, nspire_backup.c.)
 extern u8 gamepak_backup[1024 * 128];
 
 // Page sticky bit routines

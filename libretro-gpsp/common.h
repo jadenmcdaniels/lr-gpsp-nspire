@@ -62,6 +62,13 @@
 
 #endif /* ARM_ARCH */
 
+#if defined(NSPIRE_LIBRETRO) && defined(NSPIRE_HOST)
+/* The PC test build's stand-in for Ndless's os.h (tests/host/include). */
+#include <os.h>
+#include <strings.h>
+#include <ctype.h>
+#endif
+
 // Huge thanks to pollux for the heads up on using native file I/O
 // functions on PSP for vastly improved memstick performance.
 
@@ -187,10 +194,60 @@ typedef u32 fixed8_24;
 
 #define read_ioreg(regnum) (eswap16(io_registers[(regnum)]))
 #define write_ioreg(regnum, val) io_registers[(regnum)] = eswap16(val)
-#define read_ioreg32(regnum) (read_ioreg(regnum) | (read_ioreg((regnum)+1) << 16))
+#define read_ioreg32(regnum) (read_ioreg(regnum) | ((u32)read_ioreg((regnum)+1) << 16))
 
 #define read_dmareg(regnum, dmachan) (eswap16(io_registers[(regnum) + (dmachan) * 6]))
 #define write_dmareg(regnum, dmachan, val) io_registers[(regnum) + (dmachan) * 6] = eswap16(val)
+
+#if defined(NSPIRE_BUILD) && defined(NSPIRE_LAYOUT_MIRROR)
+/* The speed model (tests/arm perf): every function its own section, put
+ * where the calculator build has it by tests/arm/mirror_layout.py (a named
+ * section would be split by LTO into pieces that can't be told apart).
+ * update_gba keeps its 4 KB alignment: the model's .text starts a way. */
+#define NSPIRE_HOT
+#define NSPIRE_HOT_FIRST __attribute__((aligned(4096)))
+/* The per-line I/O functions: pinned in the calculator build (below), the
+ * mirror copies their place. */
+#define NSPIRE_LINEIO(name)
+#elif defined(NSPIRE_BUILD) && defined(NSPIRE_PINNED_LAYOUT)
+/* The calculator build (the Makefile's GAME_OBJS, pinned):
+ * every function its own section (-ffunction-sections at the link), and
+ * nspire_lineio.ld puts each the game runs, the hot stretch's by name in
+ * its order (update_gba ... arm_stub.S's nspire_hot_end), at its place in
+ * a 4 KB way. A named section (below) would be split by LTO into pieces in
+ * an order that changes with its partitions. */
+#define NSPIRE_HOT
+#define NSPIRE_HOT_FIRST __attribute__((aligned(4096)))
+#define NSPIRE_LINEIO(name) __attribute__((section(".text.lineio." #name)))
+#elif defined(NSPIRE_BUILD)
+/* What runs at every scanline event and interrupt (update_gba, the block
+ * lookups, mode switches, arm_stub.S's handlers...), kept together in one
+ * stretch of the program so its cache lines spread over all of the
+ * ARM926's 16 KB instruction cache: scattered, several landed on the same
+ * few cache sets and pushed each other out at every interrupt. */
+#define NSPIRE_HOT __attribute__((section(".text.hot.gpsp")))
+/* The first function of that stretch (update_gba) starts an instruction
+ * cache way (4 KB): the stretch then sits on the same cache sets in the
+ * calculator build and in the speed model (tests/arm perf), whatever comes
+ * before it, and against the pinned .bss and .jit (arm_stub.S).
+ * tests/calc_checks.py checks it. */
+#define NSPIRE_HOT_FIRST __attribute__((section(".text.hot.gpsp"), aligned(4096)))
+/* The per-line I/O path (write_io_register16, dma_transfer,
+ * nspire_video_write_line_regs: the battle wipes and Advance Wars run it
+ * every line) at a fixed place in a 4 KB instruction cache way, against
+ * the hot stretch above: where the linker happened to put them, a pure
+ * layout move cost the wild-battle wipe up to 12% (out-06).
+ * Each in its own section, which the Makefile's ordering file
+ * (nspire_lineio.ld) puts at its offset in a way, at the start of .text.
+ * The section only names the code: LTO compiles it as before (no_reorder
+ * or a pad function moved LTO's partitions and changed the code: tried).
+ * tests/calc_checks.py checks the places against nspire_lineio.ld. */
+#define NSPIRE_LINEIO(name) __attribute__((section(".text.lineio." #name)))
+#else
+#define NSPIRE_HOT
+#define NSPIRE_HOT_FIRST
+#define NSPIRE_LINEIO(name)
+#endif
 
 #include <unistd.h>
 #include <time.h>

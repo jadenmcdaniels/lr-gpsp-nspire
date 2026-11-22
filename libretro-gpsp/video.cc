@@ -26,6 +26,8 @@ extern "C" {
 extern "C" {
 extern u32 nspire_gba_blend_off;
 void video_fill_u16_strip_arm(u16 *dst, u32 nh, u32 value);
+void video_merge_alpha_arm(u16 *dst, const u32 *src, u32 n, u32 ab_low, const u16 *pal);
+void video_merge_obj_tab_arm(u16 *dst, const u32 *src, u32 n, const u32 *tab, const u16 *pal);
 }
 #endif
 
@@ -220,12 +222,12 @@ void video_reload_counters()
 template<typename dtype, rendtype rdtype, bool is8bpp, bool isbase, bool hflip>
 static inline void rend_part_tile_Nbpp(u32 bg_comb, u32 px_comb,
   dtype *dest_ptr, u32 start, u32 end, u16 tile,
-  const u8 *tile_base, int vertical_pixel_flip, const u16 *paltbl
+  const u8 *tile_base, int vertical_pixel_flip, const u16 *paltbl,
+  u16 bgcolor
 ) {
   // Seek to the specified tile, using the tile number and size.
   // tile_base already points to the right tile-line vertical offset
   const u8 *tile_ptr = &tile_base[(tile & 0x3FF) * (is8bpp ? 64 : 32)];
-  u16 bgcolor = paltbl[0];
 
   // On vertical flip, apply the mirror offset
   if (tile & 0x800)
@@ -291,10 +293,10 @@ static inline void rend_part_tile_Nbpp(u32 bg_comb, u32 px_comb,
 template<typename dtype, rendtype rdtype, bool is8bpp, bool isbase, bool hflip>
 static inline void render_tile_Nbpp(
   u32 bg_comb, u32 px_comb, dtype *dest_ptr, u16 tile,
-  const u8 *tile_base, int vertical_pixel_flip, const u16 *paltbl
+  const u8 *tile_base, int vertical_pixel_flip, const u16 *paltbl,
+  u16 bgcolor
 ) {
   const u8 *tile_ptr = &tile_base[(tile & 0x3FF) * (is8bpp ? 64 : 32)];
-  u16 bgcolor = paltbl[0];
 
   if (tile & 0x800)
     tile_ptr += vertical_pixel_flip;
@@ -324,6 +326,7 @@ static inline void render_tile_Nbpp(
       }
     }
   } else {
+    // (4bpp FULLCOLOR full tiles go through render_tiles_4bpp_fc below.)
     u32 tilepix = eswap32(*(u32*)tile_ptr);
     if (tilepix) {  // We can skip it all if the row is transparent
       u16 tilepal = (tile >> 12) << 4;
@@ -351,6 +354,321 @@ static inline void render_tile_Nbpp(
   }
 }
 
+// The 8 pixels of a non-empty 4bpp row, FULLCOLOR. Pixel i as a byte offset
+// into its sub-palette: (pval << 1), taken straight from the packed word with
+// one shift and an even mask, so a pixel is ands / ldrhne / strhne (plus the
+// backdrop on the base layer). The empty asm statements keep the sub-palette
+// base and the mask in registers: without them GCC adds the sub-palette per
+// pixel and uses an immediate mask (6-7 instructions a pixel).
+#if defined(NSPIRE_BUILD) && defined(__arm__) && !defined(__thumb__)
+// The same 8 pixels into a u16 line in hand-scheduled ARM. GCC's code (ands /
+// ldrhne / strhne a pixel, and moveq on the base layer) uses each colour right
+// after its load: an ARM926 halfword load's result is 2 cycles late for the
+// next instruction and 1 for the one after, so an opaque pixel cost 5 cycles
+// on either layer. Here no load is used within 3 instructions: the upper
+// layers take two pixels in 7 instructions (the first pixel's ands sets the
+// flags its store keeps; the second's colour is loaded unconditionally from
+// its sub-palette, entry 0 included, which is only read, and its store is
+// conditional on a cmp of its offset), the base layer one pixel in 4. Pixel
+// i's offset is (tilepix >> (4i - 1)) & 0x1E (pixel 0: << 1); hflip takes
+// pixel 7 - i.
+#define RROW_TPAIR(SA, SB, OA, OB)                                            \
+  "ands %[a], %[m], %[pix], " SA "\n\t"                                       \
+  "ldrneh %[a], [%[pal], %[a]]\n\t"                                           \
+  "and %[b], %[m], %[pix], " SB "\n\t"                                        \
+  "ldrh %[c], [%[pal], %[b]]\n\t"                                             \
+  "strneh %[a], [%[d], #" OA "]\n\t"                                          \
+  "cmp %[b], #0\n\t"                                                          \
+  "strneh %[c], [%[d], #" OB "]\n\t"
+#define RROW_BPAIR(SA, SB, OA, OB)                                            \
+  "ands %[a], %[m], %[pix], " SA "\n\t"                                       \
+  "ldrneh %[a], [%[pal], %[a]]\n\t"                                           \
+  "moveq %[a], %[bg]\n\t"                                                     \
+  "ands %[b], %[m], %[pix], " SB "\n\t"                                       \
+  "ldrneh %[b], [%[pal], %[b]]\n\t"                                           \
+  "moveq %[b], %[bg]\n\t"                                                     \
+  "strh %[a], [%[d], #" OA "]\n\t"                                            \
+  "strh %[b], [%[d], #" OB "]\n\t"
+#define RROW_ROW(PAIR, S0, S1, S2, S3, S4, S5, S6, S7)                        \
+  PAIR(S0, S1, "0", "2") PAIR(S2, S3, "4", "6")                               \
+  PAIR(S4, S5, "8", "10") PAIR(S6, S7, "12", "14")
+#define RROW_FWD "lsl #1", "lsr #3", "lsr #7", "lsr #11", "lsr #15", "lsr #19", "lsr #23", "lsr #27"
+#define RROW_REV "lsr #27", "lsr #23", "lsr #19", "lsr #15", "lsr #11", "lsr #7", "lsr #3", "lsl #1"
+#define RROW_EXPAND(PAIR, SHIFTS) RROW_ROW(PAIR, SHIFTS)
+
+template<bool isbase, bool hflip>
+static inline void render_row_4bpp_fc_arm(u16 *d, u32 pix, const u8 *pal, u32 bg)
+{
+  u32 a, b, c;
+  const u32 m = 0x1E;
+  u16 (*out)[8] = (u16 (*)[8])d;
+  const u16 (*in)[16] = (const u16 (*)[16])pal;
+  if (isbase && hflip)
+    __asm__(RROW_EXPAND(RROW_BPAIR, RROW_REV)
+            : [a] "=&r"(a), [b] "=&r"(b), "=m"(*out)
+            : [m] "r"(m), [pix] "r"(pix), [pal] "r"(pal), [d] "r"(d), [bg] "r"(bg), "m"(*in) : "cc");
+  else if (isbase)
+    __asm__(RROW_EXPAND(RROW_BPAIR, RROW_FWD)
+            : [a] "=&r"(a), [b] "=&r"(b), "=m"(*out)
+            : [m] "r"(m), [pix] "r"(pix), [pal] "r"(pal), [d] "r"(d), [bg] "r"(bg), "m"(*in) : "cc");
+  else if (hflip)
+    __asm__(RROW_EXPAND(RROW_TPAIR, RROW_REV)
+            : [a] "=&r"(a), [b] "=&r"(b), [c] "=&r"(c), "+m"(*out)
+            : [m] "r"(m), [pix] "r"(pix), [pal] "r"(pal), [d] "r"(d), "m"(*in) : "cc");
+  else
+    __asm__(RROW_EXPAND(RROW_TPAIR, RROW_FWD)
+            : [a] "=&r"(a), [b] "=&r"(b), [c] "=&r"(c), "+m"(*out)
+            : [m] "r"(m), [pix] "r"(pix), [pal] "r"(pal), [d] "r"(d), "m"(*in) : "cc");
+  (void)c;
+}
+#undef RROW_TPAIR
+#undef RROW_BPAIR
+#undef RROW_ROW
+#undef RROW_FWD
+#undef RROW_REV
+#undef RROW_EXPAND
+#define RROW_ARM 1
+#else
+#define RROW_ARM 0
+#endif
+
+template<typename dtype, bool isbase, bool hflip>
+static inline void render_row_4bpp_fc(dtype *dest_ptr, u32 tilepix, u32 tile,
+  const u16 *paltbl, u16 bgcolor)
+{
+  const u8 *subpal_b = (const u8*)paltbl + ((tile >> 12) << 5);
+  u32 m = 0x1E;
+#if RROW_ARM
+  if (sizeof(dtype) == 2) {
+    render_row_4bpp_fc_arm<isbase, hflip>((u16*)dest_ptr, tilepix, subpal_b, bgcolor);
+    return;
+  }
+#endif
+  __asm__("" : "+r"(subpal_b));
+  __asm__("" : "+r"(m));
+  for (u32 i = 0; i < 8; i++, dest_ptr++) {
+    u32 sel = hflip ? 7 - i : i;
+    u32 off = sel ? (tilepix >> (4*sel - 1)) & m : (tilepix << 1) & m;
+    if (isbase)
+      *dest_ptr = off ? *(const u16*)(subpal_b + off) : bgcolor;
+    else if (off)
+      *dest_ptr = *(const u16*)(subpal_b + off);
+  }
+}
+
+// `count` full 4bpp tiles, FULLCOLOR. The row word's address does not depend on
+// hflip, so it is loaded before the hflip split. A map entry's row on this
+// line depends only on the entry (tile number, flip bits, palette) and VRAM,
+// and neither changes during one render_scanline_text_fast call: on the upper
+// layers an entry equal to the last one seen with an empty row (*blank, which
+// starts at 0x10000, no u16's value) is empty again and is skipped before its
+// row is fetched. The base layer has no such skip (Dewford: none of its rows
+// is empty, the compare would only cost).
+template<typename dtype, bool isbase>
+static inline void render_tiles_4bpp_fc(dtype *dest_ptr, const u16 *map_ptr,
+  u32 count, const u8 *tile_base, s32 vflip_off, const u16 *paltbl,
+  u16 bgcolor, u32 *blank_p)
+{
+  u32 blank = *blank_p;
+  if (!count)
+    return;
+  // The map is read one entry ahead (render-02): the entry is compared and
+  // masked right away, and a halfword load's result is 2 cycles late on the
+  // ARM926 for the next instruction. The last entry read (map_ptr[count]) is
+  // never used, and it is inside vram[]: a map row is at most 72 KB into its
+  // 96 KB (block 31, plus a 512x512 map's lower and right halves).
+  u32 next = eswap16(map_ptr[0]);
+  for (u32 i = 0; i < count; i++, dest_ptr += 8) {
+    u32 tile = next;
+    next = eswap16(map_ptr[i + 1]);
+    if (!isbase && tile == blank)
+      continue;
+    const u8 *tile_ptr = tile_base + (tile & 0x3FF) * 32;
+    if (tile & 0x800)
+      tile_ptr += vflip_off;
+    u32 tilepix = eswap32(*(const u32*)tile_ptr);
+    if (!tilepix) {
+      blank = tile;
+      if (isbase)
+        for (u32 j = 0; j < 8; j++)
+          dest_ptr[j] = bgcolor;
+      continue;
+    }
+    if (tile & 0x400)
+      render_row_4bpp_fc<dtype, isbase, true>(dest_ptr, tilepix, tile, paltbl, bgcolor);
+    else
+      render_row_4bpp_fc<dtype, isbase, false>(dest_ptr, tilepix, tile, paltbl, bgcolor);
+  }
+  *blank_p = blank;
+}
+
+
+// (2026-11-17, speed9b) The same for the lines kept as palette indices with
+// their blend flags: INDXCOLOR (brightness effects, and the layers that can't
+// blend on a blended line: Golden Sun's intro draws three of its four 4bpp
+// layers so, 2.4 ms a drawn frame on the CX II) and STCKCOLOR (the layers that
+// can: the pixel over the one below it). What render_tile_Nbpp's 4bpp branch
+// stores for a full tile, a row a call: pixel i's index p = (tilepix >> 4i) &
+// 15 (hflip: 7 - i); p != 0: f | p, where f = px_comb | (tile >> 12) << 4
+// (the pixel's sub-palette and flags), STCKCOLOR also | the pixel below << 16
+// (the line's pixel there before, or bg_comb on the base layer); p == 0: the
+// base layer's 0 | bg_comb, the upper layers leave the pixel. In ARM, no load
+// but STCKCOLOR's of the pixel below (used two instructions on): 3 (upper
+// INDXCOLOR), 4 (the base layer) or 5 (upper STCKCOLOR) instructions a pixel.
+#if RROW_ARM
+// One pixel; S: the shift that brings its index to bits 0-3, O: its offset.
+// ST: the conditional store (divided syntax, as GCC's: strne, strneh) for
+// IROW_UP, the plain one (str, strh) for IROW_BASE.
+#define IROW_UP(ST, S, O)                                                     \
+  "ands %[a], %[m], %[pix], " S "\n\t"                                        \
+  "orrne %[a], %[a], %[f]\n\t"                                                \
+  ST " %[a], [%[d], #" O "]\n\t"
+#define IROW_BASE(ST, S, O)                                                   \
+  "ands %[a], %[m], %[pix], " S "\n\t"                                        \
+  "orrne %[a], %[a], %[f]\n\t"                                                \
+  "moveq %[a], %[bg]\n\t"                                                     \
+  ST " %[a], [%[d], #" O "]\n\t"
+#define IROW_STACK(ST, S, O)                                                  \
+  "ands %[a], %[m], %[pix], " S "\n\t"                                        \
+  "ldrne %[b], [%[d], #" O "]\n\t"                                            \
+  "orrne %[a], %[a], %[f]\n\t"                                                \
+  "orrne %[a], %[a], %[b], lsl #16\n\t"                                       \
+  "strne %[a], [%[d], #" O "]\n\t"
+#define IROW_ROW(PX, ST, S0, S1, S2, S3, S4, S5, S6, S7, O0, O1, O2, O3, O4, O5, O6, O7) \
+  PX(ST, S0, O0) PX(ST, S1, O1) PX(ST, S2, O2) PX(ST, S3, O3)                  \
+  PX(ST, S4, O4) PX(ST, S5, O5) PX(ST, S6, O6) PX(ST, S7, O7)
+#define IROW_FWD "lsl #0", "lsr #4", "lsr #8", "lsr #12", "lsr #16", "lsr #20", "lsr #24", "lsr #28"
+#define IROW_REV "lsr #28", "lsr #24", "lsr #20", "lsr #16", "lsr #12", "lsr #8", "lsr #4", "lsl #0"
+#define IROW_O32 "0", "4", "8", "12", "16", "20", "24", "28"
+#define IROW_O16 "0", "2", "4", "6", "8", "10", "12", "14"
+#define IROW_EXPAND(PX, ST, SHIFTS, OFFS) IROW_ROW(PX, ST, SHIFTS, OFFS)
+
+template<typename dtype, rendtype rdtype, bool isbase, bool hflip>
+static inline void render_row_4bpp_ix_arm(dtype *d, u32 pix, u32 f, u32 bg)
+{
+  u32 a, b;
+  const u32 m = 0x0F;
+  dtype (*out)[8] = (dtype (*)[8])d;
+  if (sizeof(dtype) == 4 && rdtype == STCKCOLOR && !isbase) {
+    if (hflip)
+      __asm__(IROW_EXPAND(IROW_STACK, "str", IROW_REV, IROW_O32)
+              : [a] "=&r"(a), [b] "=&r"(b), "+m"(*out)
+              : [m] "r"(m), [pix] "r"(pix), [f] "r"(f), [d] "r"(d) : "cc");
+    else
+      __asm__(IROW_EXPAND(IROW_STACK, "str", IROW_FWD, IROW_O32)
+              : [a] "=&r"(a), [b] "=&r"(b), "+m"(*out)
+              : [m] "r"(m), [pix] "r"(pix), [f] "r"(f), [d] "r"(d) : "cc");
+  } else if (sizeof(dtype) == 4 && isbase) {
+    if (hflip)
+      __asm__(IROW_EXPAND(IROW_BASE, "str", IROW_REV, IROW_O32)
+              : [a] "=&r"(a), "=m"(*out)
+              : [m] "r"(m), [pix] "r"(pix), [f] "r"(f), [d] "r"(d), [bg] "r"(bg) : "cc");
+    else
+      __asm__(IROW_EXPAND(IROW_BASE, "str", IROW_FWD, IROW_O32)
+              : [a] "=&r"(a), "=m"(*out)
+              : [m] "r"(m), [pix] "r"(pix), [f] "r"(f), [d] "r"(d), [bg] "r"(bg) : "cc");
+  } else if (sizeof(dtype) == 4) {
+    if (hflip)
+      __asm__(IROW_EXPAND(IROW_UP, "strne", IROW_REV, IROW_O32)
+              : [a] "=&r"(a), "+m"(*out)
+              : [m] "r"(m), [pix] "r"(pix), [f] "r"(f), [d] "r"(d) : "cc");
+    else
+      __asm__(IROW_EXPAND(IROW_UP, "strne", IROW_FWD, IROW_O32)
+              : [a] "=&r"(a), "+m"(*out)
+              : [m] "r"(m), [pix] "r"(pix), [f] "r"(f), [d] "r"(d) : "cc");
+  } else if (isbase) {
+    if (hflip)
+      __asm__(IROW_EXPAND(IROW_BASE, "strh", IROW_REV, IROW_O16)
+              : [a] "=&r"(a), "=m"(*out)
+              : [m] "r"(m), [pix] "r"(pix), [f] "r"(f), [d] "r"(d), [bg] "r"(bg) : "cc");
+    else
+      __asm__(IROW_EXPAND(IROW_BASE, "strh", IROW_FWD, IROW_O16)
+              : [a] "=&r"(a), "=m"(*out)
+              : [m] "r"(m), [pix] "r"(pix), [f] "r"(f), [d] "r"(d), [bg] "r"(bg) : "cc");
+  } else {
+    if (hflip)
+      __asm__(IROW_EXPAND(IROW_UP, "strneh", IROW_REV, IROW_O16)
+              : [a] "=&r"(a), "+m"(*out)
+              : [m] "r"(m), [pix] "r"(pix), [f] "r"(f), [d] "r"(d) : "cc");
+    else
+      __asm__(IROW_EXPAND(IROW_UP, "strneh", IROW_FWD, IROW_O16)
+              : [a] "=&r"(a), "+m"(*out)
+              : [m] "r"(m), [pix] "r"(pix), [f] "r"(f), [d] "r"(d) : "cc");
+  }
+  (void)b;
+}
+#undef IROW_UP
+#undef IROW_BASE
+#undef IROW_STACK
+#undef IROW_ROW
+#undef IROW_FWD
+#undef IROW_REV
+#undef IROW_O32
+#undef IROW_O16
+#undef IROW_EXPAND
+#endif
+
+template<typename dtype, rendtype rdtype, bool isbase, bool hflip>
+static inline void render_row_4bpp_ix(dtype *dest_ptr, u32 tilepix, u32 f, u32 bg)
+{
+#if RROW_ARM
+  if (!(rdtype == STCKCOLOR && sizeof(dtype) != 4)) {
+    render_row_4bpp_ix_arm<dtype, rdtype, isbase, hflip>(dest_ptr, tilepix, f, bg);
+    return;
+  }
+#endif
+  for (u32 i = 0; i < 8; i++, dest_ptr++) {
+    u32 p = (tilepix >> (4 * (hflip ? 7 - i : i))) & 0xF;
+    if (p) {
+      if (rdtype == STCKCOLOR && !isbase)
+        *dest_ptr = f | p | (*dest_ptr << 16);
+      else
+        *dest_ptr = f | p;
+    }
+    else if (isbase)
+      *dest_ptr = bg;
+  }
+}
+
+// `count` full 4bpp tiles, INDXCOLOR or STCKCOLOR: render_tiles_4bpp_fc's loop
+// (the map read one entry ahead, an upper layer's repeated empty entry
+// skipped) with render_row_4bpp_ix's rows.
+template<typename dtype, rendtype rdtype, bool isbase>
+static inline void render_tiles_4bpp_ix(dtype *dest_ptr, const u16 *map_ptr,
+  u32 count, const u8 *tile_base, s32 vflip_off, u32 px_comb, u32 bg_comb,
+  u32 *blank_p)
+{
+  u32 blank = *blank_p;
+  // STCKCOLOR's base layer stacks its pixels over the backdrop's flags
+  const u32 below = (rdtype == STCKCOLOR && isbase) ? bg_comb << 16 : 0;
+  if (!count)
+    return;
+  u32 next = eswap16(map_ptr[0]);
+  for (u32 i = 0; i < count; i++, dest_ptr += 8) {
+    u32 tile = next;
+    next = eswap16(map_ptr[i + 1]);
+    if (!isbase && tile == blank)
+      continue;
+    const u8 *tile_ptr = tile_base + (tile & 0x3FF) * 32;
+    if (tile & 0x800)
+      tile_ptr += vflip_off;
+    u32 tilepix = eswap32(*(const u32*)tile_ptr);
+    if (!tilepix) {
+      blank = tile;
+      if (isbase)
+        for (u32 j = 0; j < 8; j++)
+          dest_ptr[j] = bg_comb;
+      continue;
+    }
+    u32 f = px_comb | ((tile >> 12) << 4) | below;
+    if (tile & 0x400)
+      render_row_4bpp_ix<dtype, rdtype, isbase, true>(dest_ptr, tilepix, f, bg_comb);
+    else
+      render_row_4bpp_ix<dtype, rdtype, isbase, false>(dest_ptr, tilepix, f, bg_comb);
+  }
+  *blank_p = blank;
+}
+
 
 template<typename stype, rendtype rdtype, bool isbase, bool is8bpp>
 static void render_scanline_text_fast(u32 layer,
@@ -363,6 +681,9 @@ static void render_scanline_text_fast(u32 layer,
   u32 hoffset = (start + read_ioreg(REG_BGxHOFS(layer))) & 511;
   u32 voffset = (vcount + read_ioreg(REG_BGxVOFS(layer))) & 511;
   stype *dest_ptr = ((stype*)scanline) + start;
+  // The backdrop, read once a call (the tile functions reloaded it per tile:
+  // their stores could alias the palette as far as GCC knows).
+  u16 bgcolor = paltbl[0];
 
   // Calculate combine masks. These store 2 bits of info: 1st and 2nd target.
   u32 bldcnt = read_ioreg(REG_BLDCNT);
@@ -430,10 +751,10 @@ static void render_scanline_text_fast(u32 layer,
     u16 tile = eswap16(*map_ptr++);
     if (tile & 0x400)   // Tile horizontal flip
       rend_part_tile_Nbpp<stype, rdtype, is8bpp, isbase, true>(
-        bg_comb, px_comb, dest_ptr, tile_hoff, stop, tile, tile_base, vflip_off, paltbl);
+        bg_comb, px_comb, dest_ptr, tile_hoff, stop, tile, tile_base, vflip_off, paltbl, bgcolor);
     else
       rend_part_tile_Nbpp<stype, rdtype, is8bpp, isbase, false>(
-        bg_comb, px_comb, dest_ptr, tile_hoff, stop, tile, tile_base, vflip_off, paltbl);
+        bg_comb, px_comb, dest_ptr, tile_hoff, stop, tile, tile_base, vflip_off, paltbl, bgcolor);
 
     dest_ptr += todraw;
     end -= todraw;
@@ -445,15 +766,27 @@ static void render_scanline_text_fast(u32 layer,
 
   // Now render full tiles
   u32 todraw = MIN(end, pixel_run) >> 3;
+  u32 blank = 0x10000;
 
+  if (!is8bpp && rdtype == FULLCOLOR) {
+    render_tiles_4bpp_fc<stype, isbase>(dest_ptr, map_ptr, todraw, tile_base,
+      vflip_off, paltbl, bgcolor, &blank);
+    dest_ptr += todraw * 8;
+    map_ptr += todraw;
+  } else if (!is8bpp && (rdtype == INDXCOLOR || rdtype == STCKCOLOR)) {
+    render_tiles_4bpp_ix<stype, rdtype, isbase>(dest_ptr, map_ptr, todraw, tile_base,
+      vflip_off, px_comb, bg_comb, &blank);
+    dest_ptr += todraw * 8;
+    map_ptr += todraw;
+  } else
   for (u32 i = 0; i < todraw; i++, dest_ptr += 8) {
     u16 tile = eswap16(*map_ptr++);
     if (tile & 0x400)   // Tile horizontal flip
       render_tile_Nbpp<stype, rdtype, is8bpp, isbase, true>(
-        bg_comb, px_comb, dest_ptr, tile, tile_base, vflip_off, paltbl);
+        bg_comb, px_comb, dest_ptr, tile, tile_base, vflip_off, paltbl, bgcolor);
     else
       render_tile_Nbpp<stype, rdtype, is8bpp, isbase, false>(
-        bg_comb, px_comb, dest_ptr, tile, tile_base, vflip_off, paltbl);
+        bg_comb, px_comb, dest_ptr, tile, tile_base, vflip_off, paltbl, bgcolor);
   }
 
   end -= todraw * 8;
@@ -467,14 +800,25 @@ static void render_scanline_text_fast(u32 layer,
     map_ptr = second_ptr;
 
   todraw = end >> 3;
+  if (!is8bpp && rdtype == FULLCOLOR) {
+    render_tiles_4bpp_fc<stype, isbase>(dest_ptr, map_ptr, todraw, tile_base,
+      vflip_off, paltbl, bgcolor, &blank);
+    dest_ptr += todraw * 8;
+    map_ptr += todraw;
+  } else if (!is8bpp && (rdtype == INDXCOLOR || rdtype == STCKCOLOR)) {
+    render_tiles_4bpp_ix<stype, rdtype, isbase>(dest_ptr, map_ptr, todraw, tile_base,
+      vflip_off, px_comb, bg_comb, &blank);
+    dest_ptr += todraw * 8;
+    map_ptr += todraw;
+  } else
   for (u32 i = 0; i < todraw; i++, dest_ptr += 8) {
     u16 tile = eswap16(*map_ptr++);
     if (tile & 0x400)   // Tile horizontal flip
       render_tile_Nbpp<stype, rdtype, is8bpp, isbase, true>(
-        bg_comb, px_comb, dest_ptr, tile, tile_base, vflip_off, paltbl);
+        bg_comb, px_comb, dest_ptr, tile, tile_base, vflip_off, paltbl, bgcolor);
     else
       render_tile_Nbpp<stype, rdtype, is8bpp, isbase, false>(
-        bg_comb, px_comb, dest_ptr, tile, tile_base, vflip_off, paltbl);
+        bg_comb, px_comb, dest_ptr, tile, tile_base, vflip_off, paltbl, bgcolor);
   }
 
   end -= todraw * 8;
@@ -484,10 +828,10 @@ static void render_scanline_text_fast(u32 layer,
     u16 tile = eswap16(*map_ptr++);
     if (tile & 0x400)   // Tile horizontal flip
       rend_part_tile_Nbpp<stype, rdtype, is8bpp, isbase, true>(
-        bg_comb, px_comb, dest_ptr, 0, end, tile, tile_base, vflip_off, paltbl);
+        bg_comb, px_comb, dest_ptr, 0, end, tile, tile_base, vflip_off, paltbl, bgcolor);
     else
       rend_part_tile_Nbpp<stype, rdtype, is8bpp, isbase, false>(
-        bg_comb, px_comb, dest_ptr, 0, end, tile, tile_base, vflip_off, paltbl);
+        bg_comb, px_comb, dest_ptr, 0, end, tile, tile_base, vflip_off, paltbl, bgcolor);
   }
 }
 
@@ -1236,8 +1580,10 @@ static void render_object(
 
 // A slower version of the version above, that renders objects pixel by pixel.
 // This allows proper mosaic effects whenever necessary.
+// (r19-fx) Out of line, as render_affine_object: render_scanline_objs'
+// loop keeps the regular objects' path alone (its instruction fetches).
 template <typename stype, rendtype rdtype, bool is8bpp, bool hflip>
-static void render_object_mosaic(
+static __attribute__((noinline)) void render_object_mosaic(
   s32 delta_x, u32 cnt, stype *dst_ptr, u32 base_tile_offset,
   u32 mosh, u32 px_comb, u16 palette, const u16* pal
 ) {
@@ -1301,7 +1647,7 @@ static void render_object_mosaic(
 // They support 4bpp and 8bpp modes. 1D and 2D tile mapping modes.
 // Their render area is limited to their size (and optionally double size)
 template <typename stype, rendtype rdtype, bool mosaic, bool is8bpp, bool rotate>
-static void render_affine_object(
+static __attribute__((noinline)) void render_affine_object(
   const t_sprite *obji, const t_affp *affp, bool is_double,
   u32 start, u32 end, stype *dst_ptr, u32 mosv, u32 mosh,
   u32 base_tile, u32 pxcomb, u16 palette, const u16 *palptr
@@ -1715,6 +2061,13 @@ static void order_obj(u32 video_mode)
 u32 layer_order[16];
 u32 layer_count;
 
+// The inputs of the last order_layers run (core-08): bits 0-4
+// layer_flags, 5-12 the four BGxCNT priorities, 13-16 "an object of
+// priority 0..3 is on this line". layer_order/layer_count are a function of
+// exactly these, and only order_layers writes them, so an equal key means
+// they already hold the answer. ~0 never matches (layer_flags <= 0x1F).
+static u32 layer_order_key = ~0U;
+
 // Sorts active BG/OBJ layers and generates an ordered list of layers.
 // Things are drawn back to front, so lowest priority goes first.
 static void order_layers(u32 layer_flags, u32 vcnt)
@@ -1727,6 +2080,17 @@ static void order_layers(u32 layer_flags, u32 vcnt)
   bgcnt[1] = read_ioreg(REG_BGxCNT(1));
   bgcnt[2] = read_ioreg(REG_BGxCNT(2));
   bgcnt[3] = read_ioreg(REG_BGxCNT(3));
+
+  u32 key = layer_flags |
+            ((bgcnt[0] & 0x03) << 5) | ((bgcnt[1] & 0x03) << 7) |
+            ((bgcnt[2] & 0x03) << 9) | ((bgcnt[3] & 0x03) << 11) |
+            ((obj_priority_count[0][vcnt] != 0) << 13) |
+            ((obj_priority_count[1][vcnt] != 0) << 14) |
+            ((obj_priority_count[2][vcnt] != 0) << 15) |
+            ((obj_priority_count[3][vcnt] != 0) << 16);
+  if (key == layer_order_key)
+    return;
+  layer_order_key = key;
 
   layer_count = 0;
 
@@ -1798,6 +2162,40 @@ static void merge_blend(u32 start, u32 end, u16 * __restrict dst, u32 * __restri
   u32 blend_b = MIN(16, (bldalpha >> 8) & 0x1F);
 
   bool can_saturate = blend_a + blend_b > 16;
+
+#if RROW_ARM
+  // (r19-fx) ST objects alone (Emerald's fog and underwater blend every
+  // pixel of a line): each palette entry's 0G0R0B form times its factor
+  // looked up, made again when VRAM/palette RAM's generation (video.h
+  // nspire_video_gen: one up at every palette change) or BLDALPHA moved.
+  if (bldtype == OBJ_BLEND && st_objs) {
+    static u32 tab[512] __attribute__((aligned(32)));
+    static u32 tab_gen, tab_ab = ~0U;
+    u32 ab = blend_a | (blend_b << 8);
+    if (tab_ab != ab || tab_gen != nspire_video_gen) {
+      for (u32 i = 0; i < 256; i++) {
+        u32 o = palette_ram_converted[0x100 + i], g = palette_ram_converted[i];
+        tab[i] = ((o | (o << 16)) & BLND_MSK) * blend_a;
+        tab[256 + i] = ((g | (g << 16)) & BLND_MSK) * blend_b;
+      }
+      tab_ab = ab;
+      tab_gen = nspire_video_gen;
+    }
+    if (start < end)
+      video_merge_obj_tab_arm(&dst[start], &src[start], end - start, tab, palette_ram_converted);
+    return;
+  }
+  // The alpha pass in ARM (nspire/scanline_fill16.S): the same pixels,
+  // about 23 instructions a blended pixel and 10 another (GCC's 29 and 11).
+  if (bldtype == OBJ_BLEND || bldtype == BLEND_ONLY) {
+    if (start < end)
+      video_merge_alpha_arm(&dst[start], &src[start], end - start,
+        blend_a | (blend_b << 8) |
+        (((st_objs ? 0x800 : 0) | (bldtype == BLEND_ONLY ? 0x200 : 0)) << 16),
+        palette_ram_converted);
+    return;
+  }
+#endif
 
   if (can_saturate) {
     // If blending can result in saturation, we need to clamp output values.
@@ -2003,7 +2401,13 @@ void tile_render_layers(u32 start, u32 end, dsttype *dst_ptr, u32 enabled_layers
     }
     else if (!is_obj && ((1 << layer) & enabled_layers)) {
       bool layer_is_1st_tgt = ((bldcnt_tr >> layer) & 1) != 0;
-      bool can_skip_blend = !has_trans_obj && !layer_is_1st_tgt;
+      // (r19-fx) A background that isn't a 1st target never needs the
+      // pixel below it, semi-transparent objects or not: merge_blend reads
+      // a pixel pair's upper half only when its top is a 1st target or an
+      // ST object, and a layer drawn over this one stacks this one's lower
+      // half (the same in both modes). Emerald's fog and underwater bubbles
+      // put ST objects on every line.
+      bool can_skip_blend = !layer_is_1st_tgt;
 
       bool is_affine = (video_mode >= 1) && (layer >= 2);
       u32 fnidx = (base_done) | (is_affine ? 2 : 0);
@@ -2078,6 +2482,14 @@ static void render_w_effects(
   u32 effect_type = effects_enabled ? ((bldcnt >> 6) & 0x03)
                                     : COL_EFFECT_NONE;
 
+  // (r19-fx) EVA >= 16 and EVB == 0: merge_blend's alpha blend of a 1st
+  // target over a 2nd, ST objects' included, gives the top pixel's own
+  // colour ((p * 16 + q * 0) >> 4 = p, no saturation at 16 + 0), which is
+  // what drawing without effects gives. Emerald's weather draws its sand
+  // and ash as semi-transparent 64x64 objects at 16/0 over the whole screen
+  // (Route 111's sandstorm, Route 113's ash: every line).
+  bool blend_is_top = (bldalpha_fx & 0x1F00) == 0 && (bldalpha_fx & 0x1F) >= 16;
+
   switch (effect_type) {
   case COL_EFFECT_BRIGHT:
     {
@@ -2126,7 +2538,7 @@ static void render_w_effects(
       bool some_2nd_tgt = (bldcnt & 0x3F00) != 0;
       // If 1st target is 100% opacity and 2nd is 0%, just render regularly.
       bool non_trns_tgt = (bldalpha_fx & 0x1F1F) != 0x001F;
-      if (some_1st_tgt && some_2nd_tgt && non_trns_tgt) {
+      if (some_1st_tgt && some_2nd_tgt && non_trns_tgt && !blend_is_top) {
         u32 tmp_buf[240];
         renderers->stacked(start, end, tmp_buf, enable_flags);
         if (obj_blend)
@@ -2144,7 +2556,7 @@ static void render_w_effects(
   };
 
   // Default rendering mode, without layer effects (except perhaps sprites).
-  if (obj_blend) {
+  if (obj_blend && !blend_is_top) {
     u32 tmp_buf[240];
     renderers->stacked(start, end, tmp_buf, enable_flags);
     merge_blend<OBJ_BLEND, true>(start, end, scanline, tmp_buf);
@@ -2493,5 +2905,56 @@ void update_scanline(void)
     }
   }
 }
+
+
+#ifdef NSPIRE_BUILD
+// speed10 (nspire_reuse.c, nspire_render_time.c's update_scanline): a line
+// kept as it was, not drawn: what update_scanline does but the drawing (the
+// objects ordered again if OAM was written, the reference points stepped).
+// Its own copy (update_scanline's code as it was, its cache places too).
+extern "C" void video_cc_line_kept(void)
+{
+  u16 dispcnt = read_ioreg(REG_DISPCNT);
+  u32 vcount = read_ioreg(REG_VCOUNT);
+  u32 video_mode = dispcnt & 0x07;
+
+  if(reg[OAM_UPDATED])
+  {
+    order_obj(video_mode);
+    reg[OAM_UPDATED] = 0;
+  }
+
+  // Mode 0 does not use any affine params at all.
+  if (video_mode) {
+    const u32 bgmosv = ((read_ioreg(REG_MOSAIC) >> 4) & 0xF) + 1;
+    u16 bg2cnt = read_ioreg(REG_BG2CNT);
+    u16 bg3cnt = read_ioreg(REG_BG3CNT);
+    s16 bg2pb = (s16)read_ioreg(REG_BG2PB);
+    s16 bg2pd = (s16)read_ioreg(REG_BG2PD);
+    s16 bg3pb = (s16)read_ioreg(REG_BG3PB);
+    s16 bg3pd = (s16)read_ioreg(REG_BG3PD);
+
+    if (bg2cnt & 0x40) {   // Mosaic enabled for this BG
+      if (mosaic_umod_u32(vcount, bgmosv) == bgmosv - 1u) { // Correct after the last line
+        affine_reference_x[0] += bg2pb * (s32)bgmosv;
+        affine_reference_y[0] += bg2pd * (s32)bgmosv;
+      }
+    } else {
+      affine_reference_x[0] += bg2pb;
+      affine_reference_y[0] += bg2pd;
+    }
+
+    if (bg3cnt & 0x40) {
+      if (mosaic_umod_u32(vcount, bgmosv) == bgmosv - 1u) {
+        affine_reference_x[1] += bg3pb * (s32)bgmosv;
+        affine_reference_y[1] += bg3pd * (s32)bgmosv;
+      }
+    } else {
+      affine_reference_x[1] += bg3pb;
+      affine_reference_y[1] += bg3pd;
+    }
+  }
+}
+#endif
 
 

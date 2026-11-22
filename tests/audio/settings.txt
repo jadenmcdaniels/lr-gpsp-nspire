@@ -1,0 +1,17 @@
+# name, then perf_audio arguments (key=value). The first line is the default.
+# Every line is run by run.sh and has a reference ref/SCENE.NAME.txt.
+default
+# speed9a: the mixer's sound resampled into the USB sound's ring as the
+# calculator does it (perf_audio.h rs=): in one pass (nspire_audio_mix.h)
+# and by the three passes it replaced (rsold=1); each pair has the same
+# reference, the three passes' (sound_read_samples, the driver's rs_run and
+# ring_put) as they were when the one pass came. 44.1 and 48 kHz, fast
+# forward at 2x, a slow game's 0.3, the mono mix.
+rs44 rs=44100
+rs44old rs=44100 rsold=1
+rs48ff rs=48000 rsx=200
+rs48ffold rs=48000 rsx=200 rsold=1
+rs48slow rs=48000 rsx=30
+rs48slowold rs=48000 rsx=30 rsold=1
+rs44mono rs=44100 mono=1
+rs44monoold rs=44100 mono=1 rsold=1

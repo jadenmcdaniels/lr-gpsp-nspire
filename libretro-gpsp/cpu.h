@@ -101,11 +101,58 @@ typedef enum
   REG_SAVE5         = 30,
   REG_SAVE6         = 31,
 
+  /* core-16 (Nspire, arm_stub.S arm_update_gba_pure_thumb): a proven-pure
+     idle loop. ARMED: its stub went back into the loop's body with no PC
+     change; TAINT: a load since its last call that isn't plain memory
+     (I/O, BIOS, ROM, open bus, unaligned); OK: set by that stub around its
+     update_gba call when ARMED and not TAINT (tests/arm IDLE_CHECK=1;
+     the call then passes NSPIRE_IDLE_PURE_CALL). Not in states. */
+  REG_IDLE_ARMED    = REG_SAVE2,
+  REG_IDLE_TAINT    = REG_SAVE3,
+  REG_IDLE_OK       = REG_SAVE4,
+  /* speed9b (main.c nspire_update_gba_idle_pass): with NSPIRE_IDLE_PURE_CALL
+     update_gba runs the next event when its window is above LIMIT (0 for
+     core-16's loops: any; Advance Wars' idle pass's cost less one), and the
+     pass's state (its cost, the window and cpu_ticks of its last call, the
+     pass after that call starting at its fixed point, the measurements of
+     the cost; past REG_USERDEF's function table, cleared at reset by
+     init_main). Not in states. */
+  REG_IDLE_LIMIT    = REG_SAVE5,
+  /* speed10 (nspire_reuse.c, video.h nspire_video_gen): one up at every
+     write that changes a value in palette RAM or VRAM (arm_stub.S's store
+     handlers, gba_memory.c); negative while no line is stamped (VRAM
+     stores then count as changes unread). Not in states. */
+  REG_VIDEO_GEN     = REG_SAVE6,
+  REG_IDLE_PASS_COST   = 48,
+  REG_IDLE_PASS_WINDOW = 49,
+  REG_IDLE_PASS_TICKS  = 50,
+  REG_IDLE_PASS_FIXED  = 51,
+  REG_IDLE_PASS_SEEN   = 52,
+  /* speed10b (cpu_threaded.c "RAM blocks kept across Partial SMC's
+     flushes"): the kept blocks' store (its write and valid positions, the
+     ROM cache's context), the block being made (its instructions, the
+     scratch bit it read, the most room and PC entries it needed), counts.
+     Not in states. */
+  REG_RAM_KEEP_W       = 53,
+  REG_RAM_KEEP_V       = 54,
+  REG_RAM_KEEP_CTX     = 55,
+  REG_RAM_KEEP_N       = 56,
+  REG_RAM_KEEP_DEP     = 57,
+  REG_RAM_KEEP_NEED    = 58,
+  REG_RAM_KEEP_NEED_PCS = 59,
+  REG_RAM_KEEP_USES    = 60,
+  REG_RAM_KEEP_ARMED   = 61,
+  REG_RAM_KEEP_CLEARS  = 62,
+
   /* Machine defined storage */
   REG_USERDEF       = 32,
 
   REG_MAX           = 64
 } ext_reg_numbers;
+
+/* core-16: update_gba's argument from arm_update_gba_pure_thumb when armed
+   and untainted (main.c; never a count of remaining cycles). */
+#define NSPIRE_IDLE_PURE_CALL ((int)0x80000000)
 
 extern u32 instruction_count;
 
@@ -209,6 +256,13 @@ extern u8 *bios_swi_entrypoint;
   )
 #define GPSP_TRANSLATION_TARGET_INVALID(p)                                    \
   ((p) == NULL || (p) == (u8 *)(u32)-1)
+
+/* A jump where no code can run (a damaged ROM: an Advance Wars from a bad
+ * dump jumps to 910803DE as it starts) stops the CPU there instead of
+ * running garbage, which crashed the calculator: nspire_bad_jump is set,
+ * nspire_bad_jump_pc says where, and execute_arm_translate (or the
+ * interpreter's execute_arm) returns. The frontend says so. */
+extern u32 nspire_bad_jump, nspire_bad_jump_pc;
 #endif
 
 #endif

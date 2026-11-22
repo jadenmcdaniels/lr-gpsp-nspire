@@ -22,98 +22,168 @@
 const u8 *state_mem_read_ptr;
 u8 *state_mem_write_ptr;
 
-bool bson_contains_key(const u8 *srcp, const char *key, u8 keytype)
+/* A state is a fixed-size buffer. Validate its entire tree before any reader
+ * changes the machine; nested lengths and unterminated keys used to walk out
+ * of that buffer. The readers also bound their own walks for unit callers. */
+static bool bson_element(const u8 *p, const u8 *end, const u8 **name,
+                         const u8 **value, const u8 **next)
 {
-  unsigned keyl = strlen(key) + 1;
-  unsigned doclen = bson_read_u32(srcp);
-  const u8* p = &srcp[4];
-  while (*p != 0 && (p - srcp) < doclen) {
-    u8 tp = *p;
-    unsigned tlen = strlen((char*)&p[1]) + 1;
-    if (keyl == tlen && !memcmp(key, &p[1], tlen))
-      return tp == keytype;  // Found it, check type
-    p += 1 + tlen;
-    if (tp == BSON_TYPE_DOC || tp == BSON_TYPE_ARR)
-      p += bson_read_u32(p);
-    else if (tp == BSON_TYPE_BIN)
-      p += bson_read_u32(p) + 1 + 4;
-    else if (tp == BSON_TYPE_INT32)
-      p += 4;
+  const u8 *nul;
+  unsigned bytes;
+  if (p >= end || !(nul = (const u8 *)memchr(p + 1, 0, end - p - 1)))
+    return false;
+  *name = p + 1;
+  *value = nul + 1;
+  p = *value;
+  switch ((*name)[-1]) {
+  case BSON_TYPE_INT32:
+    bytes = 4;
+    break;
+  case BSON_TYPE_DOC:
+  case BSON_TYPE_ARR:
+    if (end - p < 4)
+      return false;
+    bytes = bson_read_u32(p);
+    if (bytes < 5)
+      return false;
+    break;
+  case BSON_TYPE_BIN:
+    if (end - p < 5)
+      return false;
+    bytes = bson_read_u32(p);
+    if (bytes > (unsigned)(end - p - 5))
+      return false;
+    bytes += 5;
+    break;
+  default:
+    return false;
   }
-  return false;
+  if (bytes > (unsigned)(end - p))
+    return false;
+  *next = p + bytes;
+  return true;
 }
 
-const u8* bson_find_key(const u8 *srcp, const char *key)
+static bool bson_validate(const u8 *src, unsigned available, unsigned depth)
 {
-  unsigned keyl = strlen(key) + 1;
-  unsigned doclen = bson_read_u32(srcp);
-  const u8* p = &srcp[4];
-  while (*p != 0 && (p - srcp) < doclen) {
-    u8 tp = *p;
-    unsigned tlen = strlen((char*)&p[1]) + 1;
-    if (keyl == tlen && !memcmp(key, &p[1], tlen))
-      return &p[tlen + 1];
-    p += 1 + tlen;
-    if (tp == BSON_TYPE_DOC || tp == BSON_TYPE_ARR)
-      p += bson_read_u32(p);
-    else if (tp == BSON_TYPE_BIN)
-      p += bson_read_u32(p) + 1 + 4;
-    else if (tp == BSON_TYPE_INT32)
-      p += 4;
+  unsigned size;
+  const u8 *p, *end, *name, *value, *next;
+  if (available < 5 || depth > 16)
+    return false;
+  size = bson_read_u32(src);
+  if (size < 5 || size > available || src[size - 1] != 0)
+    return false;
+  end = src + size - 1;
+  for (p = src + 4; p < end; p = next) {
+    if (!bson_element(p, end, &name, &value, &next))
+      return false;
+    if ((*p == BSON_TYPE_DOC || *p == BSON_TYPE_ARR) &&
+        !bson_validate(value, next - value, depth + 1))
+      return false;
+  }
+  return p == end;
+}
+
+static const u8 *bson_lookup(const u8 *src, const char *key, u8 *type)
+{
+  unsigned size, keylen = strlen(key) + 1;
+  const u8 *p, *end, *name, *value, *next;
+  if (!src)
+    return NULL;
+  size = bson_read_u32(src);
+  if (size < 5 || size > GBA_STATE_MEM_SIZE)
+    return NULL;
+  end = src + size - 1;
+  for (p = src + 4; p < end; p = next) {
+    if (!bson_element(p, end, &name, &value, &next))
+      return NULL;
+    if ((unsigned)(value - name) == keylen && !memcmp(name, key, keylen)) {
+      *type = *p;
+      return value;
+    }
   }
   return NULL;
 }
 
-bool bson_read_int32(const u8 *srcp, const char *key, u32* value)
+bool bson_contains_key(const u8 *src, const char *key, u8 keytype)
 {
-  const u8* p = srcp ? bson_find_key(srcp, key) : NULL;
-  if (!p)
+  u8 type;
+  return bson_lookup(src, key, &type) && type == keytype;
+}
+
+const u8 *bson_find_key(const u8 *src, const char *key)
+{
+  u8 type;
+  return bson_lookup(src, key, &type);
+}
+
+const u8 *bson_find_document(const u8 *src, const char *key)
+{
+  u8 type;
+  const u8 *p = bson_lookup(src, key, &type);
+  return p && type == BSON_TYPE_DOC ? p : NULL;
+}
+
+bool bson_read_int32(const u8 *src, const char *key, u32 *value)
+{
+  u8 type;
+  const u8 *p = bson_lookup(src, key, &type);
+  if (!p || type != BSON_TYPE_INT32)
     return false;
   *value = bson_read_u32(p);
   return true;
 }
 
-bool bson_read_int32_array(const u8 *srcp, const char *key, u32* value, unsigned cnt)
+bool bson_check_int32_array(const u8 *src, const char *key, unsigned cnt)
 {
-  const u8* p = srcp ? bson_find_key(srcp, key) : NULL;
-  if (p) {
-    unsigned arrsz = bson_read_u32(p);
-    p += 4;
-    if (arrsz < 5)
+  unsigned i;
+  u8 type;
+  const u8 *p = bson_lookup(src, key, &type);
+  if (!p || type != BSON_TYPE_ARR || cnt > (GBA_STATE_MEM_SIZE - 5) / 8 ||
+      (unsigned)bson_read_u32(p) != 5 + cnt * 8 || p[4 + cnt * 8] != 0)
+    return false;
+  p += 4;
+  for (i = 0; i < cnt; i++, p += 8)
+    if (p[0] != BSON_TYPE_INT32 || p[1] != '0' + i / 10 ||
+        p[2] != '0' + i % 10 || p[3] != 0)
       return false;
-    arrsz = (arrsz - 5) >> 3;
-    while (arrsz--) {
-      p += 4;   // type and name
-      *value++ = bson_read_u32(p);
-      p += 4;   // value
-    }
-    return true;
-  }
-  *value = bson_read_u32(p);
-  return false;
+  return true;
 }
 
-bool bson_read_bytes(const u8 *srcp, const char *key, void* buffer, unsigned cnt)
+bool bson_read_int32_array(const u8 *src, const char *key, u32 *value, unsigned cnt)
 {
-  const u8* p = srcp ? bson_find_key(srcp, key) : NULL;
-  if (p) {
-    unsigned bufsz = bson_read_u32(p);
-    if (bufsz != cnt)
-      return false;
-
-    // Skip byte array type and size
-    memcpy(buffer, &p[5], cnt);
-    return true;
+  const u8 *p;
+  if (!bson_check_int32_array(src, key, cnt))
+    return false;
+  p = bson_find_key(src, key) + 8;
+  while (cnt--) {
+    *value++ = bson_read_u32(p);
+    p += 8;
   }
-  return false;
+  return true;
+}
+
+bool bson_check_bytes(const u8 *src, const char *key, unsigned cnt)
+{
+  u8 type;
+  const u8 *p = bson_lookup(src, key, &type);
+  return p && type == BSON_TYPE_BIN && (unsigned)bson_read_u32(p) == cnt && p[4] == 0;
+}
+
+bool bson_read_bytes(const u8 *src, const char *key, void *buffer, unsigned cnt)
+{
+  if (!bson_check_bytes(src, key, cnt))
+    return false;
+  memcpy(buffer, bson_find_key(src, key) + 5, cnt);
+  return true;
 }
 
 bool gba_load_state(const void* src)
 {
   u32 i, tmp;
   u8* srcptr = (u8*)src;
-  u32 docsize = bson_read_u32(srcptr);
-  if (docsize != GBA_STATE_MEM_SIZE)
+  if (!srcptr || (unsigned)bson_read_u32(srcptr) != GBA_STATE_MEM_SIZE ||
+      !bson_validate(srcptr, GBA_STATE_MEM_SIZE, 0))
     return false;
 
   if (!bson_read_int32(srcptr, "info-magic", &tmp) || tmp != GBA_STATE_MAGIC)
@@ -128,6 +198,10 @@ bool gba_load_state(const void* src)
       !memory_check_savestate(srcptr) ||
       !sound_check_savestate(srcptr))
      return false;
+
+#ifdef NSPIRE_BUILD
+  nspire_video_lines_reset();
+#endif
 
   if (!(cpu_read_savestate(srcptr) &&
       input_read_savestate(srcptr) &&

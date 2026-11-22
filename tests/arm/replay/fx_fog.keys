@@ -1,0 +1,9 @@
+# Pokemon Emerald, Mt Pyre's summit in the fog: 10 tiles up the path and back.
+# FROM TO KEY (replay.c); one tile is 16 frames.
+10 168 UP
+174 332 DOWN
+338 496 UP
+502 660 DOWN
+666 824 UP
+830 988 DOWN
+994 1152 UP

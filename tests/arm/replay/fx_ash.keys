@@ -1,0 +1,12 @@
+# Pokemon Emerald, Route 113 in the falling ash: 6 tiles east on the path and back.
+# FROM TO KEY (replay.c); one tile is 16 frames.
+10 104 RIGHT
+110 204 LEFT
+210 304 RIGHT
+310 404 LEFT
+410 504 RIGHT
+510 604 LEFT
+610 704 RIGHT
+710 804 LEFT
+810 904 RIGHT
+910 1004 LEFT

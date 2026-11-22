@@ -43,7 +43,7 @@ If still bound by CPU, fuse repack + upscale (or ASM repack).
 
 ---
 
-Ideas from Gemini discussion (PPU / software renderer), with ARM926EJ-S notes
+Ideas for the PPU / software renderer, with ARM926EJ-S notes
 
 Context: typical ARM926EJ-S has 16 KiB instruction + 16 KiB data L1, no NEON, no hardware FPU; often no L2 or a small external one. The hot path is memory traffic + instruction footprint competing with data (VRAM, tile maps, scanline buffers). The items above (1)–(6) target the **Nspire host** path (LCD, repack, upscale); the ideas below target the **emulated GBA PPU** (`video.cc` / core). They interact with cache: small tables that stay resident beat large LUTs that thrash L1.
 
@@ -54,7 +54,7 @@ Context: typical ARM926EJ-S has 16 KiB instruction + 16 KiB data L1, no NEON, no
 | Per-scanline checksum on the composed 32-bit line | Hash the line; if unchanged skip blend | **Bad.** You still read every word of the line (bandwidth + D-cache pollution). On a miss-heavy core the read pass often costs as much as cheap 5:5:5 blend math. Busy games always dirty → you pay check + blend. Collision risk if the hash is too weak. |
 | Large alpha blend LUT (e.g. 512×512 × 16-bit ≈ 512 KiB) | Two-index lookup for every A+B alpha pixel | **Avoid on ARM926.** Table does not fit L1; random lookups evict code + scanline working set. Per-pixel latency can exceed a few shifts/adds in registers. |
 | 64 KiB “555 → 565” colour LUT used inside inner pixel loops | One load per output pixel | **Risky.** 64 KiB ≫ 16 KiB D-cache; inner loop becomes miss-bound. Prefer **barrel-shifter pack** (ORR with shifted fields), which this CPU does cheaply. |
-| NEON / wide SIMD tile decode | Parallel 4bpp→16bpp | **N/A** on ARM926EJ-S (no NEON). Any portable “SIMD” note from Gemini does not apply here unless you retarget a different core. |
+| NEON / wide SIMD tile decode | Parallel 4bpp→16bpp | **N/A** on ARM926EJ-S (no NEON). A portable “SIMD” idea does not apply here unless you retarget a different core. |
 
 ### Write-time dirty tracking and skipping work
 
@@ -64,7 +64,7 @@ Context: typical ARM926EJ-S has 16 KiB instruction + 16 KiB data L1, no NEON, no
 | Per-layer or “clean layer” skip with top/sub compositing | Skip decoding a BG if dirty false; reuse prior line buffer | **Moderate complexity.** gpSP-style renderers keep **top + sub** pixels for blending; you cannot skip a layer blindly if it participates in alpha without either cached intermediates or correct dependency order. Opaque-top early-out per **x** is still valid where hardware allows “done after two layers.” |
 | Tile cache + `tile_cache_dirty[]` | Decode 8×8 once; invalidate on VRAM touch | **High potential** for repeated tiles, **but** extra RAM + cache footprint for the cache. Keep the **working tile cache** small and hot; avoid huge structures that push **video.cc** / scanline code out of I-cache. |
 
-### Lookup tables and precompute (sizes from Gemini, sanity-checked)
+### Lookup tables and precompute (sizes sanity-checked)
 
 | Idea | Typical size | ARM926 / gpsp effectiveness |
 |------|--------------|------------------------------|

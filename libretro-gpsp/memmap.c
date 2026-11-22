@@ -47,6 +47,8 @@ bool validate_addr_offset(void *ptr, unsigned size, unsigned max_offset_mb) {
 	uintptr_t ref_addr = (uintptr_t)(map_jit_block);
 	uintptr_t start_addr = (uintptr_t)ptr;
 	uintptr_t end_addr = start_addr + size;
+	if (end_addr < start_addr)
+		return false;
 	uintptr_t dist1 = start_addr > ref_addr ? start_addr - ref_addr
 	                                        : ref_addr - start_addr;
 	uintptr_t dist2 = end_addr > ref_addr ? end_addr - ref_addr
@@ -56,11 +58,13 @@ bool validate_addr_offset(void *ptr, unsigned size, unsigned max_offset_mb) {
 	       dist2 < max_offset_mb * 1024 * 1024;
 }
 
-bool validate_addr_section_mips(void *ptr, unsigned size, unsigned max_offset_mb) {
+bool validate_addr_section_mips(void *ptr, unsigned size) {
 	uintptr_t ref_addr = (uintptr_t)(map_jit_block);
 	uintptr_t start_addr = (uintptr_t)ptr;
 	uintptr_t end_addr = start_addr + size;
-	const uintptr_t msk = ~0xFFFFFFFU;  // 256MB block
+	if (end_addr < start_addr)
+		return false;
+	const uintptr_t msk = ~(uintptr_t)0xFFFFFFFU;  // 256MB block
 
 	return (ref_addr & msk) == (start_addr & msk) &&
 	       (ref_addr & msk) == (end_addr & msk);
@@ -112,8 +116,8 @@ bool validate_addr_section_mips(void *ptr, unsigned size, unsigned max_offset_mb
 
 			void *p = mmap((void*)baddr, size, PROT_READ|PROT_WRITE|PROT_EXEC,
 			                                   MAP_ANON|MAP_PRIVATE, -1, 0);
-			if (p) {
-				if (_VALIDATE_BLOCK_FN(p, size))
+			if (p != MAP_FAILED) {
+				if (p && _VALIDATE_BLOCK_FN(p, size))
 					return p;
 
 				munmap(p, size);

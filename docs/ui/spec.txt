@@ -1,0 +1,220 @@
+gpSP for the TI-Nspire: the user interface ("plain")
+====================================================
+
+r19 (2026-11-21) changed the screens' structure, the keys in the menus, the settings and the Keys page:
+docs/ui/r19.txt is how it is now. Where the two differ, r19.txt holds. What stands from here: the look (1,
+3, 4), the grid's lines and band (2, with the left edge now 8 for everything and the tabs' row at the top),
+the battery's reading (9).
+
+Everything below is drawn by the real code (nspire_ui.c, nspire_ui_screens.c,
+nspire_osd.c; the menus' tree and what the keys do are gui.c's).
+tests/host/ui_wired.sh OUTDIR draws every screen on the PC through that code;
+its "court" scene draws the main ones with real games (court-<what it
+shows>.png; the scene kept its name from the look before).
+
+1. WHAT IT IS BUILT ON
+----------------------
+A white page, black type in one monospaced face at one size, things shown as
+a grid of pictures with a short name under each, a top row of a few words
+instead of menus, nothing decorated, no notes. The menus follow from it:
+  - The games are a grid, three by two, each its latest save's picture with
+    its name under it. Only the picked game is in its own colours; the others
+    are black and white prints, so the one colour on a screen is the game
+    you are on.
+  - The paused menu isn't a list: the picture is in the middle of the
+    screen, the choices are one row along its bottom.
+  - A settings page is a list (r16): a line each, its name at the left,
+    its value at the right; up/down move, left/right change the value.
+  - A line's name and its value say what it is, the value with its unit or
+    its meaning ("15 presses/s", "4 in a row", "Auto: 396 MHz", "No
+    limit"; never a bare number or a word that needs the manual). What a
+    setting does is said once, under the settings page's grid, in one or
+    two plain lines for the picked cell. What has to be said elsewhere is
+    said in a few capital words ("NO CABLE", "PICK LINK ON BOTH").
+
+2. GRID
+-------
+(r16, nspire_ui.h "The grid".) 320 x 240, one left edge
+(x 14), as far in on the right; two columns of 142, 8 apart (the second
+from x 164); three of 97 (the game list). Every screen is three parts in
+the same places:
+  header       small words on baseline 20, no rule: the title, where
+               it is opened from before it in grey, a note and the
+               battery at the right; the paused menu's game name too
+  body         from row 36 in lines of 18 (a line's text 13 under its
+               top); a settings cell is two lines (36, its block 34);
+               at most ten lines (to row 216)
+  band         rows 222-239, one line on baseline 235: what just
+               happened, else the picked thing's one sentence, else the
+               keys that aren't obvious; the paused menu's row of
+               choices is its band
+  game list    pictures 88 x 59 at rows 34 and 118, a name on one line
+               under each (cut "..."); the picked game's whole name and
+               its facts on the body's line 9
+  paused menu  the paused game 240 x 160 at (40, 36), a saved picture
+               144 x 96 in the middle of the same place; what it is on
+               the body's line 9 (baseline 211); Settings: its pages as
+               a list from row 36
+  settings     a list from row 36: the name left, the value right
+
+3. TYPE
+-------
+IBM Plex Mono (Regular and Medium), one size: 11 px. Medium for names and
+choices, Regular for the rest; capitals for names, tabs and choices. The
+headers too (until 2026-11-17 the screens' titles were the big words, twice
+the height of what was under them; now they are the size of the rest), and
+a question's title. docs/fonts/README.md says where it comes from and how the glyphs
+are made.
+
+4. COLOUR
+---------
+Black and white. A white ground, black type; no rules or frames where
+whitespace and alignment do the job (r16).
+The picked thing is a black block with its type in white. Values and
+facts are black (r16). One dark grey (#545454), only for what is
+deliberately in the back: the tab you are not on and where a page is
+opened from, a list's section names, the names of keys that do nothing
+on the keypad drawing, what isn't there. No light grey anywhere.
+
+5. COMPONENTS
+-------------
+  tab          a word in capitals; the one you are on black, the others grey
+  picked       a black block, its type in white (a choice in the row, the
+               picked game's name, the picked cell, the picked list line)
+  answer       a word in the band; the picked one a black block (r16:
+               a question's answers are as the paused menu's choices)
+  key chip     a black chip with the key's name in white (the band at the
+               bottom); on the Keys page an outlined chip, white on the
+               picked line's block
+  picture      a game's own picture; one not picked: in black and white;
+               none: the game's initial alone, or EMPTY, no frame
+  progress     an outline 6 high, filled black as far as it has got
+
+6. THE SCREENS
+--------------
+  Games        tabs GAMES and FOLDERS (r16: no counts), the battery at
+               the right; the grid; the picked game's whole name on the
+               line over the band, its last save and how many saves at
+               that line's right; past six games, where these are along
+               the right edge.
+  Paused       which game at the top left, the battery at the right; the
+               picture in the middle; the row in the band: Resume, Save,
+               Load, Link, Games, Settings, Quit. Save goes back to the
+               game (r16). Settings: its pages listed in the middle, each
+               with what it holds now; up/down pick one, enter opens it
+               (no Settings screen of its own).
+               Resume: the paused game as it was, 240 x 160 pixel for
+               pixel, its last save on the line under it; up/down:
+               another game's saved picture as it is, its name and when
+               it was played under it; while there are others, "^ 2/5 v"
+               at the top right (r16).
+               Save, Load: the slot's picture, its neighbours small either
+               side; "SLOT-07" and its age under it.
+               Link: the two calculators and the cable; the state, and what
+               to do, in a few words.
+  Settings     a list. Pages: Sound, Controller, (Bluetooth), Keys,
+               Picture, Speed, Saving, Link, (Cheats), System (About gpSP
+               and the rest). A page or a thing to do is a line like the
+               others, its name and what it holds or what enter does
+               ("Speed test  Run, 25 s", "About  gpSP, credits ->").
+  Starting     the header (STARTING); the game's picture where the paused
+               menu has it, its name in capitals under it, the bar, how
+               far ("2 OF 4 MB").
+  In a game    the speed readout at the top left, each number after its
+               name and a colon: "FPS: 60", "FPS: 60  DRAWN: 54",
+               "FPS: 60.0  CPU: 11.5 GFX: 0.1 OUT: 2.7 IDLE: 2.3";
+               messages at the bottom band's left corner, in capitals,
+               white on black, up for their reading time (r16).
+  Keys         the list of buttons with their keys, the calculator's keypad
+               or the controller beside it: keys that do something outlined,
+               the picked button's black.
+  Questions    a screen of their own: the title and what happens on the
+               white, the answers in the band (r16; until then a card
+               over the screen it asked about); the safe answer picked
+               first.
+
+7. WHAT THE KEYS DO, EVERYWHERE
+-------------------------------
+  arrows        move on the screen as it is laid out: the grid in four
+                directions; the paused menu's row left and right, up and
+                down picking another game (Resume) or slot (Save, Load); a
+                settings page's cells as a grid. Up or down past an edge
+                goes to the other end of the same column (the game list:
+                the same column of the first or last row; a shorter row
+                under it: its last game)
+  a long text   a name or value too long for its place ends in "...";
+                in the picked line or cell it waits a second, then
+                scrolls to its end
+  enter         does the picked thing: opens it, flips it, starts changing
+                it (then left/right change it, enter keeps it, esc puts it
+                back)
+  esc, menu     back one step; from the paused menu, to the game
+  The keys on A and B are enter and esc too. A controller's D-pad, A and B
+  do the same. 8 2 5 4 6 are the arrows in every menu (the game list too);
+  no number key starts, loads or picks anything (until 2026-11-17 1-9 and
+  0 started the list's first ten games).
+
+8. SIZE
+-------
+ARM -O3 (nspire-gcc, the calculator's flags), text + data.
+
+9. THE BATTERY: HOW A PROGRAM CAN READ IT
+-----------------------------------------
+What is known
+  * Neither Ndless nor the OS gives programs a battery call. The SDK headers
+    (Ndless/ndless-sdk/include) have nothing; the OS has an internal
+    read_adc (named in Ndless's IDC files for CX OS 4.5.4 at 0x100DD630 and
+    4.5.5 at 0x100DD5F0), not a syscall and not named for any CX II OS.
+    The percentage the OS shows on its status screen is its own sum.
+  * CX (and CX CAS, older non-CX II): the ADC is at 0xC4000000 (Firebird
+    core/misc.c, mem.c). Seven channels, channel n's registers at
+    0xC4000100 + n * 0x20: write 1 to +0x00 to measure, the 10-bit result
+    at +0x10 (+0x04, +0x08, +0x0C, +0x14: setup, count, DMA address,
+    speed). Interrupt status / mask at 0xC4000004 / 0xC4000008. Scale:
+    155 units a volt on channels 1 and 2, 310 on the others; 0x3FF when the
+    ADC's clock is off (0x900B0020 bit 4, the CX's power controller).
+    Channel 3 is the keypad type (about 73 for a touchpad keypad).
+    Firebird answers 930 on every other channel, so it does not say which
+    one carries the battery (VBATT or VSYS); on the old AAA models it was a
+    155-a-volt channel. 930 at 155 a volt is 6.0 V (AAA x4), at 310 3.0 V.
+  * CX II: 0x900B0000 is the ADC (Firebird's map; on the CX it is the power
+    controller, nspire_clock.c). Firebird does not model it (reads
+    0x6969, raises the ADC interrupt on any write), so neither its
+    registers nor its scale are known. The power controller is at
+    0x90140000 (nspire_clock.c, nspire_os.c log it); no battery register
+    is known there either.
+  * Charging: no charger status is known on either model. A computer or a
+    charger on the USB port is visible as something on the port at the
+    device's end (nspire_usb_plugged, the OTG ID bit in nspire_usb_bits);
+    that is "on USB power", not "charging", and a link cable to the other
+    calculator must not count. UNVERIFIED.
+
+What must be measured on two calculators (a CX and a CX II)
+  1. A small Ndless test program (not gpSP) that, every 2 s, reads
+     (CX) all seven ADC channels at 0xC4000100 + n * 0x20, and (CX II) the
+     words at 0x900B0000-0x900B00FF before and after writing 1 to each
+     word that looks like a channel's command register, and appends them
+     to a file with the time.
+  2. Run it at three charge levels the OS reports (about 90%, 50% and
+     15%: the OS's status screen, written down at the same time), once on
+     battery and once with the USB cable to a computer in.
+  3. The channel whose value falls with the OS's percentage is the battery;
+     its three readings against the OS's three percentages give the curve
+     (a Li-ion cell: roughly 3.4 V empty to 4.1-4.2 V full, not linear;
+     map it piecewise between the measured points). The USB-in readings
+     show how far charging lifts the reading, and whether some bit tells
+     charging.
+
+How the number behaves (the engineer's rules)
+  * Read at most once every 5 s, only while a menu is on the screen (never
+    in the game loop: no cost a frame); five readings make the first value.
+  * Smooth: the median of the last five readings, then a slow average
+    (each new value moves it 1/8 of the way).
+  * Show whole percents, but only move the shown figure when the smoothed
+    one is 2 points away, or has stayed 1 point away for a minute: no
+    82-81-82 flicker. On battery the figure never goes up; on USB power
+    it never goes down.
+  * Low below 15%, with the same 2-point margin to go back.
+  * Unknown (an unmeasured model, a reading of 0 or 0x3FF, or out of the
+    measured range): ui_battery = -1 and the header shows nothing. A
+    battery that is wrong is worse than none.

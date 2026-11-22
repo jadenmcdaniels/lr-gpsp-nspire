@@ -54,7 +54,7 @@ New block headers are allocated from a descending counter **`ram_block_tag`**, s
 
 `partial_flush_ram_inner()` scans **left** from the written SMC cell and clears halfwords until it reads **`0` or `0xFFFF`**:
 
-```3542:3551:c:\Users\Owner\Downloads\nspire\gpsp-master\nspire-libretro-standalone\libretro-gpsp\cpu_threaded.c
+```3542:3551:libretro-gpsp/cpu_threaded.c
   while (1)
   {
     smc_data -= 2;
@@ -69,7 +69,7 @@ New block headers are allocated from a descending counter **`ram_block_tag`**, s
 
 `SMC_TAG_UB16` is defined next to the partial-flush comment block:
 
-```3465:3465:c:\Users\Owner\Downloads\nspire\gpsp-master\nspire-libretro-standalone\libretro-gpsp\cpu_threaded.c
+```3465:3465:libretro-gpsp/cpu_threaded.c
 #define SMC_TAG_UB16 0xFFFFu
 ```
 
@@ -96,7 +96,7 @@ That is fully consistent with “**partial flush only**” and intermittent reco
 **File:** `libretro-gpsp/cpu_threaded.c`  
 **Symbols:** `INITIAL_TOP_TAG`, comments above `#define LAST_TAG_NUM` / `INITIAL_TOP_TAG`.
 
-```2506:2537:c:\Users\Owner\Downloads\nspire\gpsp-master\nspire-libretro-standalone\libretro-gpsp\cpu_threaded.c
+```2506:2537:libretro-gpsp/cpu_threaded.c
 // INITIAL_TOP_TAG must not be 0xFFFF: partial_flush_ram_inner's left scan treats
 // halfword 0xFFFF (SMC_TAG_UB16) as "stop without clearing". The first allocated
 // block used to get 0xFFFF, so an interior SMC flush left that header + stale
@@ -161,7 +161,7 @@ So the decision matches **tag granularity** and odd destinations still observe t
 **File:** `libretro-gpsp/gba_memory.c`  
 **Macros:** `dma_write_ewram`, `dma_write_iwram` (inside the `dma_tf_loop` builder).
 
-```1782:1823:c:\Users\Owner\Downloads\nspire\gpsp-master\nspire-libretro-standalone\libretro-gpsp\gba_memory.c
+```1782:1823:libretro-gpsp/gba_memory.c
 /* SMC tags are u16; 8-bit DMA used to gate on address8() and could miss a tag
  * with a zero low or high byte, skipping partial_flush and leaving stale JIT. */
 #define dma_write_iwram(type, tfsize)                                         \
@@ -217,6 +217,8 @@ Implementation summary:
 - `partial_flush_ram_full` / `partial_flush_ram_full_dma` in `cpu_threaded.c` call `flush_dynarec_caches()` when policy is non-zero.
 - `gba_branch_emit_pc_relative_link` in `libretro-gpsp/arm/arm_emit.h` (Ndless build; mirrored under `temp/arm/`) expands to `1` when policy is non-zero.
 - `nspire_dynarec_ram_policy_menu_hook` + `nspire_emulator_options_apply` handle cache flush when the user toggles the option.
+
+**In this source (2026-10):** `arm_emit.h` has no `gba_branch_emit_pc_relative_link`. Every direct branch is emitted as a placeholder that `translate_block` patches, and Partial patched only BIOS and cart ROM targets, so a branch from RAM code to another RAM block kept its placeholder (`B +0`) and ran the next host instructions instead: calls and loops in IWRAM code were skipped (issues #3-#5; Pokemon Emerald froze after loading a state). Exits that aren't linked now jump to a PC lookup (as BX does) emitted after the block. Also, CPU stores to translated RAM go through `arm_stub.S`, which calls `flush_translation_cache_ram` with either setting; only DMA takes the partial path. `tests/arm/dynarec_test.c` covers both settings.
 
 ## Verification
 

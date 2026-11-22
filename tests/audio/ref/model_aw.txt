@@ -1,0 +1,12 @@
+frame 600 51afc94c
+layout: the calculator build's (gpsp_libretro.elf)
+570 frames timed (570 drawn); estimated ms per frame on the CX II at 396 MHz:
+  game     6.22   (dynarec code 5.17, translating 0.01, events 1.02, DMA 0.00, audio 0.02)
+  drawing  3.26   per drawn frame
+  picture  3.21   per drawn frame
+  all      12.69   per frame on average: 78.8 game frames a second with no speed limit
+  instructions a frame (exact, layout-free): game 699,173, drawing 692,456 and picture 537,331 per drawn frame, all 1,928,960
+  slowest 120 frames in a row: 78.4 game frames a second; slowest frame 13.32 ms
+  fast forward drawing 60 pictures a second (from these averages): 98 game frames a second
+  summary: normal 100% (60/60 drawn), fast forward max 1.65x (60 pictures a second: 388 ms of each second, the game 612), with pictures capped at 15 a second 2.43x
+cycles 2897939461 instructions 1168446463 imiss 5080936 dmiss 5788407 storemiss 65670938 wbstall 9058742 fillwait 16716872

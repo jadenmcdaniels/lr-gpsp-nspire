@@ -36,18 +36,18 @@
 
 // Unpacks big endian integers used for signaling
 static inline u32 upack32(const u8 *ptr) {
-  return ptr[3] | (ptr[2] << 8) | (ptr[1] << 16) | (ptr[0] << 24);
+  return ptr[3] | (ptr[2] << 8) | (ptr[1] << 16) | ((u32)ptr[0] << 24);
 }
 
 // Unpacks payload data, which is little-endian
 static inline u32 leupack32(const u8 *ptr) {
-  return ptr[0] | (ptr[1] << 8) | (ptr[2] << 16) | (ptr[3] << 24);
+  return ptr[0] | (ptr[1] << 8) | (ptr[2] << 16) | ((u32)ptr[3] << 24);
 }
 
 // The following commands, names and bit fields are not a 100% known.
 // Most of them is guessed via reverse engineering the adapter and/or
 // games that use it. Please take it with a grain of salt.
-// You might wanna check:
+// You might want to check:
 // https://github.com/afska/gba-link-connection/
 // https://blog.kuiper.dev/gba-wireless-adapter
 
@@ -238,6 +238,8 @@ void rfu_reset() {
   rfu_timeout = RFU_DEF_TIMEOUT;
   rfu_rtx_max = RFU_DEF_RTXMAX;
   memset(&rfu_host, 0, sizeof(rfu_host));
+  memset(&rfu_client, 0, sizeof(rfu_client));
+  memset(&rfu_tx_buf, 0, sizeof(rfu_tx_buf));
 
   // Clear all the received broadcasts.
   memset(&rfu_peer_bcst, 0, sizeof(rfu_peer_bcst));
@@ -442,15 +444,17 @@ static s32 rfu_process_command() {
     if (!rfu_plen)
       return 0;
 
-    if (rfu_state == RFU_STATE_HOST) {
-      // Read data to be sent into the TX buffer
-      rfu_tx_buf.blen = rfu_buf[0] & 0x7F;
-      memcpy(rfu_tx_buf.buf, &rfu_buf[1], (rfu_plen - 1)*sizeof(u32));
-    }
-    else if (rfu_state == RFU_STATE_CLIENT) {
-      // Same as above, but the header encoding is funny
-      rfu_tx_buf.blen = (rfu_buf[0] >> (8 + rfu_client.clnum * 5)) & 0x1F;
-      memcpy(rfu_tx_buf.buf, &rfu_buf[1], (rfu_plen - 1)*sizeof(u32));
+    /* rfu_buf accepts up to 255 command words, but the transmit buffer
+     * only holds 23. Bound the copy, but preserve bytes beyond a short
+     * update: Emerald legitimately sends a header-only host update with
+     * byte count 1, reusing the transmit buffer's existing contents. */
+    if (rfu_plen - 1 > sizeof(rfu_tx_buf.buf) / sizeof(rfu_tx_buf.buf[0]))
+      return -1;
+    if (rfu_state == RFU_STATE_HOST || rfu_state == RFU_STATE_CLIENT) {
+      unsigned bytes = rfu_state == RFU_STATE_HOST ? rfu_buf[0] & 0x7f :
+                       (rfu_buf[0] >> (8 + rfu_client.clnum * 5)) & 0x1f;
+      rfu_tx_buf.blen = bytes;
+      memcpy(rfu_tx_buf.buf, &rfu_buf[1], (rfu_plen - 1) * sizeof(u32));
     }
 
     /* fallthrough */
@@ -473,7 +477,7 @@ static s32 rfu_process_command() {
       if (rfu_tx_buf.blen <= 16) {
         // Send it immediately! This is not really accurate.
         rfu_net_send_data(rfu_client.host_id, NET_RFU_CLIENT_SEND,
-          (rfu_tx_buf.blen << 24) | (rfu_client.clnum << 16) | rfu_client.devid,
+          ((u32)rfu_tx_buf.blen << 24) | (rfu_client.clnum << 16) | rfu_client.devid,
           rfu_tx_buf.buf, rfu_tx_buf.blen);
       }
     }
@@ -710,6 +714,14 @@ void rfu_frame_update() {
   }
 }
 
+#ifdef NSPIRE_HOST
+/* R6: the fuzz test (frontend_tests.c) puts the adapter where a game's
+ * commands would: hosting, connecting or a client. */
+void rfu_test_state(unsigned state) {
+  rfu_state = state;
+}
+#endif
+
 void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
   // RFU1 header, just some minor sanity check really.
   if (len >= 12 && upack32((const u8*)buf) == NET_RFU_HEADER) {
@@ -723,7 +735,8 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
     case NET_RFU_BROADCAST:
       // Fill the broadcast slot for the peer
       RFU_DEBUG_LOG("Got broadcast (client: #%d devID: %02x)\n", client_id, hdata);
-      if (client_id < MAX_RFU_PEERS) {
+      // R6: only a whole one (its six words): a short one read past it.
+      if (client_id < MAX_RFU_PEERS && len >= 12 + 6 * 4) {
         rfu_peer_bcst[client_id].device_id = hdata;
         rfu_peer_bcst[client_id].valid = 1;
         rfu_peer_bcst[client_id].ttl = 0xff;
@@ -772,7 +785,7 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
         // Clear state and install device ID and slot number.
         memset(&rfu_client, 0, sizeof(rfu_client));
         rfu_client.devid = hdata & 0xffff;
-        rfu_client.clnum = hdata >> 16;
+        rfu_client.clnum = (hdata >> 16) & 0x3;   // R6: the other side's; 0-3 (it shifts by it)
         rfu_client.host_id = client_id;
         rfu_state = RFU_STATE_CLIENT;
         RFU_DEBUG_LOG("Client connected with slot ID %d\n", rfu_client.clnum);
@@ -832,8 +845,12 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
         u32 clid = (hdata >> 16) & 0x3;
         u32 blen = hdata >> 24;
 
-        // Validate the slot with device ID
-        if (rfu_host.clients[clid].devid == cdevid) {
+        // Validate the slot with device ID. R6: and the length, which the
+        // other side sends (up to 255): a client packet is 16 bytes at
+        // most, and a longer one overran the slot (the other calculator's
+        // bad message would have written over this one's memory).
+        if (rfu_host.clients[clid].devid == cdevid &&
+            blen <= sizeof(rfu_host.clients[clid].pkts[0].data) && len >= 12 + blen) {
           rfu_host.clients[clid].clttl = 0;   // Account for packet reception
           for (i = 0; i < 4; i++) {
             if (!rfu_host.clients[clid].pkts[i].datalen) {
@@ -863,7 +880,7 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
 }
 
 // Account for consumed cycles and return if a serial IRQ should be raised.
-bool rfu_update(unsigned cycles) {
+static __attribute__((noinline)) bool rfu_update_busy(unsigned cycles) {
   if (rfu_comstate == RFU_COMSTATE_WAITEVENT) {
     // Force receive packets so that we can perhaps abort the wait
     // This helps minimize latency (otherwise we need to wait a full frame!)
@@ -932,5 +949,13 @@ bool rfu_update(unsigned cycles) {
   }
 
   return false;
+}
+
+// Runs at every event: nothing to do unless a transfer waits (out of line,
+// so the code every event runs stays small: common.h NSPIRE_HOT).
+NSPIRE_HOT bool rfu_update(unsigned cycles) {
+  if (rfu_comstate != RFU_COMSTATE_WAITEVENT && rfu_comstate != RFU_COMSTATE_WAITRESP)
+    return false;
+  return rfu_update_busy(cycles);
 }
 

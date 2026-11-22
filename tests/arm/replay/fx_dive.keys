@@ -1,0 +1,12 @@
+# Pokemon Emerald, Underwater Route 124, diving (tests/emerald_fx_states.py dive): 7 tiles east
+# and back on the sea floor without seaweed (no wild Pokemon there).
+# FROM TO KEY (replay.c); one tile is 16 frames.
+10 120 RIGHT
+126 236 LEFT
+242 352 RIGHT
+358 468 LEFT
+474 584 RIGHT
+590 700 LEFT
+706 816 RIGHT
+822 932 LEFT
+938 1048 RIGHT

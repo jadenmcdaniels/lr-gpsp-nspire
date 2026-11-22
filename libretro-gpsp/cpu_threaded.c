@@ -54,6 +54,16 @@ u8 *ram_translation_ptr = ram_translation_cache;
 #endif
 /* Note, see stub files for more cache definitions */
 
+#ifdef NSPIRE_HOST
+/* The speed model (tests/arm/perf.c ramjit=N) starts the RAM blocks N
+ * bytes into their cache, to see what the blocks' place in the
+ * instruction cache does to a scene; 0 everywhere else. */
+u32 nspire_ram_cache_start;
+#define NSPIRE_RAM_CACHE_START nspire_ram_cache_start
+#else
+#define NSPIRE_RAM_CACHE_START 0
+#endif
+
 u32 iwram_code_min = ~0U;
 u32 iwram_code_max =  0U;
 u32 ewram_code_min = ~0U;
@@ -220,6 +230,27 @@ typedef struct
   #include "arm/arm64_emit.h"
 #else
   #include "x86/x86_emit.h"
+#endif
+
+/* Code an emitter puts after a block's exits (arm_emit.h, NSPIRE: block
+   transfers' per-register code); block_tails_bytes bounds what is pending. */
+#ifndef generate_block_tails
+  #define generate_block_tails_start()
+  #define generate_block_tails()
+  #define block_tails_bytes 0
+#endif
+
+/* An emitter's tables of the code it emits (arm_emit.h, NSPIRE: the PC of
+   each memory access, core-17), emptied with their cache when the next
+   translation starts (mem_pc_settle). */
+#ifndef mem_pc_full
+  #define mem_pc_full(ram_region, translation_ptr) 0
+  #define mem_pc_init()
+  #define mem_pc_flush_ram()
+  #define mem_pc_flush_rom()
+  #define mem_pc_settle()
+  #define mem_pc_bios_start()
+  #define mem_pc_bios_end()
 #endif
 
 /* Cache invalidation */
@@ -2542,6 +2573,417 @@ inline static ramtag_type* get_ram_tag(u16 tagval) {
   return &tbl[tgidx >> 1];  /* Since LSB is always 1 and thus unused */
 }
 
+#if defined(NSPIRE_BUILD) && defined(ARM_ARCH)
+/* speed10b (2026-11-18, made exact 2026-11-19): RAM blocks kept across
+ * Partial SMC's flushes.
+ *
+ * A CPU store over translated RAM code flushes the whole RAM cache (the
+ * stubs' SMC path, write_epilogue): every tag cleared, every block made
+ * again as it next runs. Golden Sun rewrites a few words of its IWRAM mixer
+ * whenever its mode changes (0x03000800), 1,197 flushes in 2,400 frames, and
+ * translated the same ~430 blocks 23,600 times (15.8 MB of code, 0.32 ms of
+ * each frame).
+ *
+ * The RAM cache is the old one: the same code at the same places, the same
+ * tags, tag table, PC table and code bounds, flushed where it was (an SMC
+ * store, its size, its PC table). Only how a block's code gets there
+ * changes (Golden Sun cx2: 3.06 -> 2.86 ms a frame in the model). From the
+ * first SMC flush on (Partial SMC, nspire_dynarec_ram_policy 0, the
+ * default), each RAM block translated is also kept, with what its
+ * translation read and left, in a store in the cache's free part (a ring
+ * between RAM_KEEP_LO and RAM_KEEP_HI, emptied when the cache's code or
+ * tag table would reach it; ram_keep_ent). When a block is to be made and
+ * the store has one of its key (PC and mode) whose GBA bytes RAM still has,
+ * and, where the translation reads it, the same scratch bit (scan_block
+ * leaves the last instruction's block_data[].update_cycles as an earlier
+ * translation left it when the scan ends there, and the translate loop
+ * reads it), the kept code is copied to where the translation would write
+ * it (ram_keep_use): its branches out of the block moved by the distance
+ * (the places of every branch offset the translation encoded:
+ * arm_relative_offset logs them), its PC table entries added there, the
+ * tags, code bounds and scratch set as the scan and translate loop set
+ * them. That is what the translation would write, byte for byte: what it
+ * reads is the bytes, the key, the scratch bit, the ROM blocks its exits
+ * link to (a ROM flush empties the store) and settings that only a whole
+ * flush changes. The copy is made only where none of the translation's
+ * checks would have flushed the cache on the way (the most room and PC
+ * entries they needed, kept: ram_keep_full), else the block is translated
+ * and flushes there; and only where its code stays clear of the store. A
+ * span across a mirror's end isn't kept (the bytes compared wouldn't be the
+ * ones read).
+ *
+ * tests/arm/run.sh: KEEP_CHECK=1 translates every block that would be
+ * copied and compares it word for word with the copy (and the PC entries,
+ * tags, bounds, scratch; every predicted flush is checked to happen);
+ * KEEP_TRACE=1 builds with and without the keeping (NOKEEP=1) print the RAM
+ * cache's code, tags, tag table and PC table and every block made as each
+ * frame ends, compared line by line at 16, 32 KB, full size and with a
+ * small PC table (RAMPCS=1). bc1a00a's first form used the kept code where
+ * it was made and followed the old cache by counts: not exact (its real
+ * cache started over and remade the old cache's blocks from other inputs;
+ * its room test used a block's final size); these checks fail on it.
+ *
+ * Memory: none added: the store is in the RAM cache, its 128-slot table and
+ * the scratch bitmap in arm_stub.S's nspire_ram_keep_table (the st/ld_lookup
+ * tables' space, unused since core-10), the branch log in
+ * nspire_block_tail_state's padding, the state in reg[] words 53-62. */
+#ifdef NSPIRE_NO_RAM_KEEP
+#define RAM_KEEP_ON          0   /* (tests/arm NOKEEP=1: as before speed10b) */
+#else
+#define RAM_KEEP_ON          (!nspire_dynarec_ram_policy)
+#endif
+#define RAM_KEEP_SLOTS       128
+#define ram_keep_table       nspire_ram_keep_table
+extern u32 nspire_ram_keep_table[RAM_KEEP_SLOTS + 32];   /* arm_stub.S */
+/* the store: entries at positions (bytes written since the start) up to
+   W; those from V on, and within the ring's size of W, are there */
+#define ram_keep_w           reg[REG_RAM_KEEP_W]
+#define ram_keep_v           reg[REG_RAM_KEEP_V]
+#define ram_keep_ctx         reg[REG_RAM_KEEP_CTX]
+/* the block being made: its instructions, whether its translation reads
+   the last one's update_cycles as the scan found it, the most room and PC
+   table entries its checks needed */
+#define ram_keep_n           reg[REG_RAM_KEEP_N]
+#define ram_keep_dep         reg[REG_RAM_KEEP_DEP]
+#define ram_keep_need        reg[REG_RAM_KEEP_NEED]
+#define ram_keep_need_pcs    reg[REG_RAM_KEEP_NEED_PCS]
+#define ram_keep_uses        reg[REG_RAM_KEEP_USES]
+#define ram_keep_clears      reg[REG_RAM_KEEP_CLEARS]
+/* 1 from the first SMC flush on: before, nothing is kept or looked for (a
+   game whose code never changes pays one test a translation) */
+#define ram_keep_armed       reg[REG_RAM_KEEP_ARMED]
+/* the update_cycles of the block being made, a bit an instruction (1024) */
+#define ram_keep_bits_now    (nspire_ram_keep_table + RAM_KEEP_SLOTS)
+/* The store's ring, in the cache's offsets [LO, HI), a power of two in
+   size: below it the code of all but the largest spans between flushes
+   (Golden Sun's are a few KB; 102 KB in the 384 KB cache), above it the
+   tag table of up to SIZE / 16 / 8 tags. Code that would come within
+   RAM_KEEP_MARGIN of LO (the room a block's checks leave for one
+   instruction and its exits: TRANSLATION_CACHE_LIMIT_THRESHOLD, as the
+   cache's own limit), or a tag table that would reach HI, empties it. */
+#define RAM_KEEP_HI          (RAM_TRANSLATION_CACHE_SIZE -                    \
+                              RAM_TRANSLATION_CACHE_SIZE / 16)
+#define RAM_KEEP_ROOM        (RAM_KEEP_HI - 4 * TRANSLATION_CACHE_LIMIT_THRESHOLD)
+#define RAM_KEEP_CAP                                                          \
+  (RAM_KEEP_ROOM >= 262144 ? 262144 : RAM_KEEP_ROOM >= 131072 ? 131072 :     \
+   RAM_KEEP_ROOM >= 65536 ? 65536 : RAM_KEEP_ROOM >= 32768 ? 32768 :         \
+   RAM_KEEP_ROOM >= 16384 ? 16384 : RAM_KEEP_ROOM >= 8192 ? 8192 : 4096)
+#define RAM_KEEP_LO          (RAM_KEEP_HI - RAM_KEEP_CAP)
+#define RAM_KEEP_MARGIN      TRANSLATION_CACHE_LIMIT_THRESHOLD
+
+typedef struct
+{
+  u32 key;          /* pc | thumb */
+  u32 end;          /* the GBA code [key & ~1, end), within one mirror */
+  u32 next;         /* this slot's older entry (position + 1; 0: none) */
+  u32 size;         /* the entry's bytes */
+  u32 code_at;      /* where its code was made */
+  u32 code_size;
+  u32 need;         /* the most room its translation's checks needed */
+  u32 need_pcs;     /* and PC table entries */
+  u16 n;            /* its instructions */
+  u16 dep;          /* 1: made with the last one's update_cycles as found */
+  u16 pcs;          /* its PC table entries */
+  u16 relocs;       /* its branches out of the block */
+} ram_keep_ent;     /* then the GBA bytes (padded to a word), the
+                       update_cycles the translation left (a bit an
+                       instruction), the PC entries (offset in the code, PC
+                       word), the relocations (u16 word indices, padded),
+                       the code */
+
+#define ram_keep_ent_bits(e)                                                  \
+  ((u32 *)((u8 *)((e) + 1) + (((e)->end - ((e)->key & ~1U) + 3) & ~3U)))
+#define ram_keep_ent_pcs(e)                                                   \
+  (ram_keep_ent_bits(e) + ((e)->n + 31) / 32)
+#define ram_keep_ent_relocs(e)                                                \
+  ((u16 *)(ram_keep_ent_pcs(e) + 2 * (e)->pcs))
+#define ram_keep_ent_code(e)                                                  \
+  ((u32 *)(ram_keep_ent_relocs(e) + (((e)->relocs + 1) & ~1U)))
+
+static u32 ram_keep_slot(u32 key)
+{
+  return (key * 2654435761u) >> 25;
+}
+
+extern block_data_type block_data[];   /* (below: the translation's scratch) */
+
+static ram_keep_ent *ram_keep_at(u32 pos)
+{
+  return (ram_keep_ent *)&ram_translation_cache[RAM_KEEP_LO +
+   (pos & (RAM_KEEP_CAP - 1))];
+}
+
+/* the entry at pos still there (not emptied, not written over) */
+static int ram_keep_live(u32 pos)
+{
+  return pos - ram_keep_v < ram_keep_w - ram_keep_v &&
+         ram_keep_w - pos <= RAM_KEEP_CAP;
+}
+
+static void ram_keep_clear(void)
+{
+  if (ram_keep_v != ram_keep_w)
+    ram_keep_clears++;
+  ram_keep_v = ram_keep_w;
+}
+
+/* where the tags' table ends now (it grows down from the cache's top) */
+static u8 *ram_keep_tags_low(void)
+{
+  return &ram_translation_cache[RAM_TRANSLATION_CACHE_SIZE -
+   (0x10000 - ram_block_tag) / 2 * sizeof(ramtag_type)];
+}
+
+static u8 *ram_keep_bytes(u32 pc)
+{
+  return pc >= 0x03000000 ? &iwram[0x8000 + (pc & 0x7FFF)] : &ewram[pc & 0x3FFFF];
+}
+
+/* scan_block's tags and translate's update_pc_limits for the span (within
+   one mirror: its offsets rise with its PCs) */
+static void ram_keep_tags(u32 start, u32 end, u32 width)
+{
+  u32 n = (end - start) / width, lo, hi, i;
+  u8 *t;
+  if (start >= 0x03000000)
+  {
+    lo = start & 0x7FFF;
+    hi = (end - width) & 0x7FFF;
+    t = &iwram[lo];
+    iwram_code_min = MIN(lo, iwram_code_min);
+    iwram_code_max = MAX(hi, iwram_code_max);
+  }
+  else
+  {
+    lo = start & 0x3FFFF;
+    hi = (end - width) & 0x3FFFF;
+    t = &ewram[0x40000 + lo];
+    ewram_code_min = MIN(lo, ewram_code_min);
+    ewram_code_max = MAX(hi, ewram_code_max);
+  }
+  if (width == 4)
+  {
+    for (i = 0; i < n; i++, t += 4)
+      if (!address32(t, 0))
+        address32(t, 0) = CODE_TAG_BLOCK32;
+  }
+  else
+  {
+    for (i = 0; i < n; i++, t += 2)
+      if (!address16(t, 0))
+        address16(t, 0) = CODE_TAG_BLOCK16;
+  }
+}
+
+#ifdef NSPIRE_KEEP_CHECK
+/* tests/arm KEEP_CHECK=1: a block that would be copied is copied (the
+   calculator's ram_keep_copy), what the copy made kept here, the copy
+   undone, the block translated and compared with it (ram_keep_check); a
+   predicted flush checked to happen. Also counted: copies with a branch
+   into the ROM cache (an SWI's to bios_swi_entrypoint). */
+u32 nspire_keep_check_ok, nspire_keep_check_bad, nspire_keep_check_flush_ok,
+ nspire_keep_check_flush_bad, nspire_keep_check_skipped, nspire_keep_check_rom;
+static u32 ram_keep_expect;       /* 1 a copy, 2 a flush */
+static struct
+{
+  u32 key, end, n, dep, need, need_pcs, size, pcs;
+  u8 *at;
+  u32 code[16384];
+  nspire_mem_pc_type pc[8192];
+  u32 tags[1024];
+  u32 bounds[4];
+  u8 scratch[1024];
+} ram_keep_made;
+#endif
+#if defined(NSPIRE_KEEP_CHECK) || defined(NSPIRE_KEEP_TRACE)
+/* (tests/arm) ROM flushes that found kept blocks, the store started over
+   at 2^31 */
+u32 nspire_keep_rom_clears, nspire_keep_w_resets;
+#endif
+#ifdef NSPIRE_KEEP_TRACE
+static void ram_trace_made(u32 key, u32 end, u32 n, u32 dep, u32 bit);
+static void ram_trace_event(u32 v);
+#endif
+
+/* A kept block for this key whose bytes RAM still has (and the scratch
+   bit its translation read), or NULL. */
+static ram_keep_ent *ram_keep_find(u32 key)
+{
+  u32 at = ram_keep_table[ram_keep_slot(key)], k, start = key & ~1U;
+  for (k = 0; at && k < 64; k++)
+  {
+    ram_keep_ent *e;
+    if (!ram_keep_live(at - 1))
+      return NULL;    /* (older ones are gone too) */
+    e = ram_keep_at(at - 1);
+    at = e->next;
+    if (e->key == key &&
+        !memcmp(ram_keep_bytes(start), e + 1, e->end - start) &&
+        (!e->dep || (block_data[e->n - 1].update_cycles & 1) ==
+          ((ram_keep_ent_bits(e)[(e->n - 1) >> 5] >> ((e->n - 1) & 31)) & 1)))
+      return e;
+  }
+  return NULL;
+}
+
+/* The kept block e at dest as its translation writes it: the code (the
+   branches out of the block moved by the distance), its PC table entries,
+   the tags and code bounds, the scratch it leaves. */
+static void ram_keep_copy(const ram_keep_ent *e, u8 *dest)
+{
+  const u32 *bits = ram_keep_ent_bits(e), *pcs = ram_keep_ent_pcs(e);
+  const u16 *rel = ram_keep_ent_relocs(e);
+  u32 *d = (u32 *)dest, i;
+  s32 delta = (s32)(e->code_at - (u32)dest) >> 2;
+  nspire_mem_pc_type *t = &nspire_pcs.ram[nspire_pcs.ram_count];
+
+  memcpy(d, ram_keep_ent_code(e), e->code_size);
+  for (i = 0; i < e->relocs; i++)
+    d[rel[i]] = (d[rel[i]] & 0xFF000000) | ((d[rel[i]] + delta) & 0xFFFFFF);
+  for (i = 0; i < e->pcs; i++)
+  {
+    t[i].host = (u32)dest + pcs[2 * i];
+    t[i].pc = pcs[2 * i + 1];
+  }
+  nspire_pcs.ram_count += e->pcs;
+  ram_keep_tags(e->key & ~1U, e->end, (e->key & 1) ? 2 : 4);
+  for (i = 0; i < e->n; i++)
+    block_data[i].update_cycles = (bits[i >> 5] >> (i & 31)) & 1;
+  ram_translation_ptr = dest + e->code_size;
+}
+
+#ifdef NSPIRE_KEEP_CHECK
+/* KEEP_CHECK: the copy made, what it made kept (ram_keep_made), then
+   undone (the tags, bounds, scratch, PC table count and code pointer as
+   they were) for the translation, which ram_keep_check compares. */
+static void ram_keep_check_copy(const ram_keep_ent *e, u8 *dest)
+{
+  u32 start = e->key & ~1U, width = (e->key & 1) ? 2 : 4, i, pc;
+  u32 pcs0 = nspire_pcs.ram_count, bounds[4];
+  static u32 tags[1024];
+  static u8 scratch[1024];
+  const u16 *rel = ram_keep_ent_relocs(e);
+  const u32 *code = ram_keep_ent_code(e);
+
+  for (pc = start, i = 0; pc < e->end; pc += width, i++)
+  {
+    u8 *t = pc >= 0x03000000 ? &iwram[pc & 0x7FFF] :
+                               &ewram[0x40000 + (pc & 0x3FFFF)];
+    tags[i] = width == 4 ? address32(t, 0) : address16(t, 0);
+  }
+  bounds[0] = iwram_code_min;
+  bounds[1] = iwram_code_max;
+  bounds[2] = ewram_code_min;
+  bounds[3] = ewram_code_max;
+  for (i = 0; i < 1024; i++)
+    scratch[i] = block_data[i].update_cycles;
+
+  ram_keep_copy(e, dest);
+
+  ram_keep_made.key = e->key;
+  ram_keep_made.end = e->end;
+  ram_keep_made.n = e->n;
+  ram_keep_made.dep = e->dep;
+  ram_keep_made.need = e->need;
+  ram_keep_made.need_pcs = e->need_pcs;
+  ram_keep_made.at = dest;
+  ram_keep_made.size = ram_translation_ptr - dest;
+  memcpy(ram_keep_made.code, dest, ram_keep_made.size);
+  ram_keep_made.pcs = nspire_pcs.ram_count - pcs0;
+  for (i = 0; i < ram_keep_made.pcs; i++)
+  {
+    ram_keep_made.pc[i].host = nspire_pcs.ram[pcs0 + i].host - (u32)dest;
+    ram_keep_made.pc[i].pc = nspire_pcs.ram[pcs0 + i].pc;
+  }
+  for (pc = start, i = 0; pc < e->end; pc += width, i++)
+  {
+    u8 *t = pc >= 0x03000000 ? &iwram[pc & 0x7FFF] :
+                               &ewram[0x40000 + (pc & 0x3FFFF)];
+    ram_keep_made.tags[i] = width == 4 ? address32(t, 0) : address16(t, 0);
+    if (width == 4)
+      address32(t, 0) = tags[i];
+    else
+      address16(t, 0) = tags[i];
+  }
+  ram_keep_made.bounds[0] = iwram_code_min;
+  ram_keep_made.bounds[1] = iwram_code_max;
+  ram_keep_made.bounds[2] = ewram_code_min;
+  ram_keep_made.bounds[3] = ewram_code_max;
+  iwram_code_min = bounds[0];
+  iwram_code_max = bounds[1];
+  ewram_code_min = bounds[2];
+  ewram_code_max = bounds[3];
+  for (i = 0; i < 1024; i++)
+  {
+    ram_keep_made.scratch[i] = block_data[i].update_cycles;
+    block_data[i].update_cycles = scratch[i];
+  }
+  nspire_pcs.ram_count = pcs0;
+  ram_translation_ptr = dest;
+
+  /* (a branch into the ROM cache among the moved ones) */
+  for (i = 0; i < e->relocs; i++)
+  {
+    u32 w = code[rel[i]];
+    u32 target = e->code_at + rel[i] * 4 + 8 + ((s32)(w << 8) >> 6);
+    if (target - (u32)rom_translation_cache < ROM_TRANSLATION_CACHE_SIZE)
+    {
+      nspire_keep_check_rom++;
+      break;
+    }
+  }
+}
+#endif
+
+/* translate_block_*(pc, ram)'s first step (RAM_KEEP_TRY): 0 nothing kept
+   (translate and keep it), 1 the kept block copied where the translation
+   would write it (done), 2 one kept but not copied here (translate, which
+   flushes if the copy wouldn't fit: not kept again). (In translate_block_*,
+   not in the lookups: their code is pinned in the hot stretch.) */
+static __attribute__((noinline)) u32 ram_keep_use(u32 key)
+{
+  ram_keep_ent *e = ram_keep_find(key);
+  u8 *dest = ram_translation_ptr;
+  u8 *limit = &ram_translation_cache[RAM_TRANSLATION_CACHE_SIZE -
+   TRANSLATION_CACHE_LIMIT_THRESHOLD - (0x10000 - ram_block_tag) / 2 *
+   sizeof(ramtag_type)];
+
+  if (!e)
+    return 0;
+  /* translate_block_*'s check after one of its instructions would fail
+     (translation_cache_limit, mem_pc_full): it flushes there */
+  if (dest + e->need > limit ||
+      nspire_pcs.ram_count + e->need_pcs + 64 > NSPIRE_RAM_PCS_LIMIT)
+  {
+#ifdef NSPIRE_KEEP_CHECK
+    ram_keep_expect = 2;
+#endif
+    return 2;
+  }
+  /* the copy's code (at most need and the exits' room) clear of the store */
+  if (dest + e->need + RAM_KEEP_MARGIN > &ram_translation_cache[RAM_KEEP_LO])
+    return 2;
+#ifdef NSPIRE_KEEP_CHECK
+  if (e->code_size <= sizeof(ram_keep_made.code) && e->n <= 1024 &&
+      e->pcs <= 8192)
+  {
+    ram_keep_check_copy(e, dest);
+    ram_keep_expect = 1;
+  }
+  else
+    nspire_keep_check_skipped++;
+  return 2;
+#endif
+  ram_keep_copy(e, dest);
+  ram_keep_uses++;
+#ifdef NSPIRE_KEEP_TRACE
+  ram_trace_made(key, e->end, e->n, e->dep,
+   (ram_keep_ent_bits(e)[(e->n - 1) >> 5] >> ((e->n - 1) & 31)) & 1);
+#endif
+  return 1;
+}
+#endif
+
 // This function will return a pointer to a translated block of code. If it
 // doesn't exist it will translate it, if it does it will pass it back.
 
@@ -2559,7 +3001,7 @@ inline static ramtag_type* get_ram_tag(u16 tagval) {
 
 
 #define block_lookup_translate_builder(type)                                  \
-u8 function_cc *block_lookup_translate_##type(u32 pc)                         \
+NSPIRE_HOT u8 function_cc *block_lookup_translate_##type(u32 pc)              \
 {                                                                             \
   u8 pcregion = (pc >> 24);                                                   \
   u16 *location;                                                              \
@@ -2662,35 +3104,148 @@ u8 function_cc *block_lookup_address_dual(u32 pc)
   }
 }
 
-u8 function_cc *block_lookup_address_arm(u32 pc)
+#ifdef NSPIRE_BUILD
+/* The blocks last found at ROM and BIOS addresses, which arm_stub.S's
+ * branches look up first (cached_lookup): the hash table behind
+ * block_lookup_address_* is 256 KB, so nearly every lookup there missed the
+ * 8 KB data cache, and games look blocks up at every return from a
+ * function and every interrupt. Key: the PC, Thumb ones with bit 0 set;
+ * entry (key ^ (key >> 12)) & 2047 (BLOCK_CACHE_SIZE - 1; arm_stub.S
+ * cached_lookup). Translated RAM code isn't kept here, any write can take it
+ * away (arm_stub.S finds them from their tags). Emptied with the ROM cache
+ * (keys ~1: no PC).
+ * (2026-11-17, speed9b) Was (key >> 1) & 1023, 1024 entries: the BIOS's IRQ
+ * vector 0x18 and Advance Wars' idle loop's return 0x08038819 shared entry
+ * 12 and threw each other out at every interrupt (316 lookups in C a frame
+ * of its 333 ROM/BIOS ones). Bits 12 up folded in, and twice the entries
+ * (an ARM and a Thumb key of one PC side by side): the stub's index is as
+ * many instructions as before, and the 8 KB more moves the .bss after it
+ * by two whole ways of either cache. */
+#define BLOCK_CACHE_SIZE 2048
+u32 nspire_block_cache[BLOCK_CACHE_SIZE][2] __attribute__((aligned(32)));
+
+/* Empty: ~1, which no key is (ARM keys are multiples of 4, Thumb ones odd):
+ * arm_stub.S probes keys from 0x0E000000 up too (since speed9b), and a Thumb
+ * branch to 0xFFFFFFFE has the key ~0. */
+#define BLOCK_CACHE_EMPTY (~1U)
+static void block_cache_clear(void)
 {
   unsigned i;
+  for (i = 0; i < BLOCK_CACHE_SIZE; i++)
+    nspire_block_cache[i][0] = BLOCK_CACHE_EMPTY;
+}
+
+static inline void block_cache_put(u32 key, u8 *block)
+{
+  u32 *entry = nspire_block_cache[(key ^ (key >> 12)) & (BLOCK_CACHE_SIZE - 1)];
+  if ((key >> 24) - 2 < 2 || key >= 0x0E000000)   /* RAM, or no ROM */
+    return;
+#ifdef NSPIRE_LOOKUP_COUNT
+  {
+    extern u32 nspire_lookup_evict[3];   /* empty slot, another key, this key */
+    nspire_lookup_evict[entry[0] == BLOCK_CACHE_EMPTY ? 0 : entry[0] != key ? 1 : 2]++;
+    if (entry[0] != BLOCK_CACHE_EMPTY && entry[0] != key)
+    {
+      /* the pairs that evict each other (perf prints the commonest) */
+      extern u32 nspire_lookup_pairs[256][3];
+      u32 a = entry[0] < key ? entry[0] : key, b = entry[0] < key ? key : entry[0], i;
+      for (i = 0; i < 256 && nspire_lookup_pairs[i][2] &&
+                  (nspire_lookup_pairs[i][0] != a || nspire_lookup_pairs[i][1] != b); i++)
+        ;
+      if (i < 256)
+      {
+        nspire_lookup_pairs[i][0] = a;
+        nspire_lookup_pairs[i][1] = b;
+        nspire_lookup_pairs[i][2]++;
+      }
+    }
+  }
+#endif
+  entry[0] = key;
+  entry[1] = (u32)block;
+}
+#else
+#define block_cache_clear()
+#define block_cache_put(key, block)
+#endif
+
+#ifdef NSPIRE_LIBRETRO
+/* arm_stub.S: back to whatever called execute_arm_translate. */
+extern u8 arm_return_to_main[];
+
+/* No code can run at pc (the lookup's (u8*)~0: no memory, I/O, save
+ * memory...), or it couldn't be translated: stop there (cpu.h) rather than
+ * jump to that marker, which crashed the calculator. The lookups get the
+ * PC with its low bits as the branch left them (Thumb bit, ARM + 2). */
+static u8 *nspire_stop_at(u32 pc)
+{
+  nspire_bad_jump = 1;
+  nspire_bad_jump_pc = pc;
+  return arm_return_to_main;
+}
+#endif
+
+#ifdef NSPIRE_LOOKUP_COUNT
+/* Model-only (tests/arm/perf.c, make ... LOOKUP_COUNT=1): the lookups that
+ * reach C, [thumb][0 ROM/BIOS, 1 IWRAM/EWRAM, 2 other]. No build of the
+ * calculator or of the speed model has them. */
+u32 nspire_lookup_count[2][3], nspire_lookup_evict[3], nspire_lookup_pairs[256][3];
+#define lookup_count(thumb, pc)                                               \
+  nspire_lookup_count[thumb][((pc) >> 24) - 2 < 2 ? 1 :                       \
+                             (pc) < 0x0E000000 ? 0 : 2]++
+#else
+#define lookup_count(thumb, pc)
+#endif
+
+NSPIRE_HOT u8 function_cc *block_lookup_address_arm(u32 pc)
+{
+  unsigned i;
+  lookup_count(0, pc);
   for (i = 0; i < 4; i++) {
     u8 *ret = block_lookup_translate_arm(pc);
     if (ret) {
+#ifdef NSPIRE_LIBRETRO
+      if (ret == (u8 *)(~0))
+        return nspire_stop_at(pc & ~3);
+#endif
       translate_icache_sync();
+      block_cache_put(pc & ~3, ret);
       return ret;
     }
   }
 
   printf("bad jump %x (%x)\n", pc, reg[REG_PC]);
   fflush(stdout);
+#ifdef NSPIRE_LIBRETRO
+  return nspire_stop_at(pc & ~3);
+#else
   return NULL;
+#endif
 }
 
-u8 function_cc *block_lookup_address_thumb(u32 pc)
+NSPIRE_HOT u8 function_cc *block_lookup_address_thumb(u32 pc)
 {
   unsigned i;
+  lookup_count(1, pc);
   for (i = 0; i < 4; i++) {
     u8 *ret = block_lookup_translate_thumb(pc);
     if (ret) {
+#ifdef NSPIRE_LIBRETRO
+      if (ret == (u8 *)(~0))
+        return nspire_stop_at(pc & ~1);
+#endif
       translate_icache_sync();
+      block_cache_put((pc & ~1) | 1, ret);
       return ret;
     }
   }
   printf("bad jump %x (%x)\n", pc, reg[REG_PC]);
   fflush(stdout);
+#ifdef NSPIRE_LIBRETRO
+  return nspire_stop_at(pc & ~1);
+#else
   return NULL;
+#endif
 }
 
 // Potential exit point: If the rd field is pc for instructions is 0x0F,
@@ -2925,6 +3480,30 @@ block_exit_type block_exits[MAX_EXITS];
 
 #define smc_write_thumb_no()                                                  \
 
+/* core-13: true when the instruction that ended the block (scan_block's
+ * break with no earlier exit to block_end_pc) leaves it on every path, so
+ * the translation gate after it is dead code. Thumb: every unconditional
+ * exit point does: b and bl/blh (generate_branch / indirect), bx, pop {pc}
+ * and mov pc (indirect branch, also after the per-register code's join),
+ * swi but the HLE divide (not an exit point). ARM: only an unconditional
+ * B, BL, exact BX or SWI (not 6/7); the other exit points (rd = 15 forms,
+ * ldm with pc) keep the gate, and a conditional last instruction's skip
+ * is patched to land on it. */
+#define thumb_block_end_exits 1
+
+#define arm_block_end_exits                                                   \
+  ((condition == 0x0E) &&                                                     \
+   (arm_opcode_branch || ((opcode & 0xFFFFFF0) == 0x12FFF10) ||               \
+    (arm_opcode_swi && !is_div_swi((opcode >> 16) & 0xFF))))                  \
+
+#ifdef NSPIRE_GATE_TRAP
+/* Debug builds (tests/arm GATE_TRAP=1): an undefined instruction where a
+ * gate was left out; it must never run. */
+#define generate_translation_gate_skipped() write32(0xE7F000F0)
+#else
+#define generate_translation_gate_skipped()
+#endif
+
 #define scan_block(type, smc_write_op)                                        \
 {                                                                             \
   __label__ block_end;                                                        \
@@ -2975,7 +3554,10 @@ block_exit_type block_exits[MAX_EXITS];
         }                                                                     \
                                                                               \
         if(i < 0)                                                             \
+        {                                                                     \
+          block_end_exits = type##_block_end_exits;                           \
           break;                                                              \
+        }                                                                     \
       }                                                                       \
       if(block_exit_position == MAX_EXITS)                                    \
         break;                                                                \
@@ -3020,6 +3602,70 @@ if (ram_region) {                                                             \
   }                                                                           \
 }                                                                             \
 
+#if defined(NSPIRE_BUILD) && defined(ARM_ARCH)
+static void ram_keep_begin(void);
+static void ram_keep_scanned(u32 start, u32 end, u32 width, s32 exits, s32 scanned);
+static void ram_keep_full(u8 *ptr, u8 *start, u32 pcs0);
+static void ram_keep_end(u32 key, u32 end, u8 *start, u32 pcs0, u32 ctx0, u32 found);
+
+/* translate_block_*'s hooks: one test each while nothing is kept (keep_on
+   0: a ROM block, Classic SMC, before the first SMC flush), the work out
+   of line (the translation loop's code stays small: its fetches cost the
+   ROM translations) */
+#define RAM_KEEP_START(thumbbit)                                              \
+  u8 *keep_start = ram_translation_ptr;                                       \
+  u32 keep_pcs0 = nspire_pcs.ram_count, keep_ctx = ram_keep_ctx;              \
+  u32 keep_found = 0;                                                         \
+  const u32 keep_on = ram_region && RAM_KEEP_ON && ram_keep_armed;            \
+  if (keep_on)                                                                \
+    ram_keep_begin()
+
+/* At a RAM block's translation: the kept one's code copied, if any. */
+#define RAM_KEEP_TRY(thumbbit)                                                \
+  if (keep_on && (keep_found = ram_keep_use(pc | (thumbbit))) == 1)           \
+    return true
+
+/* After the scan and the internal targets (ram_keep_scanned). */
+#define RAM_KEEP_SCANNED(width)                                               \
+  if (keep_on)                                                                \
+    ram_keep_scanned(block_start_pc, block_end_pc, (width),                   \
+     block_exit_position, block_data_position)
+
+/* With translate_block_*'s check after each instruction (ram_keep_full):
+   the room and PC entries it needs, the store kept clear. */
+#define RAM_KEEP_FULL_CHECK()                                                 \
+  if (keep_on)                                                                \
+    ram_keep_full(translation_ptr, keep_start, keep_pcs0)
+
+#define RAM_KEEP_RECORD(thumbbit)                                             \
+  if (keep_on)                                                                \
+    ram_keep_end(block_start_pc | (thumbbit), block_end_pc, keep_start,       \
+     keep_pcs0, keep_ctx, keep_found)
+#else
+#define RAM_KEEP_START(thumbbit)
+#define RAM_KEEP_TRY(thumbbit)
+#define RAM_KEEP_SCANNED(width)
+#define RAM_KEEP_FULL_CHECK()
+#define RAM_KEEP_RECORD(thumbbit)
+#endif
+
+#ifdef NSPIRE_KEEP_TRACE
+/* tests/arm KEEP_TRACE=1: every RAM block made, by what it was made from
+   (ram_trace_made), with and without the keeping */
+static void ram_trace_scanned(u32 start, u32 end, u32 width, s32 exits, s32 scanned);
+static void ram_trace_done(u32 key, u32 end);
+#define RAM_TRACE_SCANNED(width)                                              \
+  if (ram_region)                                                             \
+    ram_trace_scanned(block_start_pc, block_end_pc, (width),                  \
+     block_exit_position, block_data_position)
+#define RAM_TRACE_DONE(thumbbit)                                              \
+  if (ram_region)                                                             \
+    ram_trace_done(block_start_pc | (thumbbit), block_end_pc)
+#else
+#define RAM_TRACE_SCANNED(width)
+#define RAM_TRACE_DONE(thumbbit)
+#endif
+
 bool translate_block_arm(u32 pc, bool ram_region)
 {
   u32 opcode = 0;
@@ -3042,6 +3688,7 @@ bool translate_block_arm(u32 pc, bool ram_region)
   u8 *translation_cache_limit = NULL;
   s32 i;
   u32 flag_status;
+  u32 block_end_exits = 0;
   block_exit_type external_block_exits[MAX_EXITS];
   generate_block_extra_vars_arm();
   arm_fix_pc();
@@ -3049,6 +3696,9 @@ bool translate_block_arm(u32 pc, bool ram_region)
   if(!pc_address_block)
     pc_address_block = load_gamepak_page(pc_region & 0x3FF);
 
+  mem_pc_settle();
+  RAM_KEEP_START(0);
+  RAM_KEEP_TRY(0);
   if (ram_region) {
     translation_ptr = ram_translation_ptr;
     translation_cache_limit = &ram_translation_cache[
@@ -3062,6 +3712,7 @@ bool translate_block_arm(u32 pc, bool ram_region)
   }
 
   generate_block_prologue();
+  generate_block_tails_start();
 
   /* This is a function because it's used a lot more than it might seem (all
      of the data processing functions can access it), and its expansion was
@@ -3087,6 +3738,8 @@ bool translate_block_arm(u32 pc, bool ram_region)
        arm_instruction_width].update_cycles = 1;
     }
   }
+  RAM_KEEP_SCANNED(arm_instruction_width);
+  RAM_TRACE_SCANNED(arm_instruction_width);
 
   arm_dead_flag_eliminate();
 
@@ -3114,7 +3767,9 @@ bool translate_block_arm(u32 pc, bool ram_region)
        a simple recursive call here won't work, it has to pedal out to
        the beginning. */
 
-    if(translation_ptr > translation_cache_limit) {
+    RAM_KEEP_FULL_CHECK();
+    if(translation_ptr + block_tails_bytes > translation_cache_limit ||
+     mem_pc_full(ram_region, translation_ptr)) {
       if (ram_region)
         flush_translation_cache_ram();
       else
@@ -3136,9 +3791,18 @@ bool translate_block_arm(u32 pc, bool ram_region)
     generate_branch_patch_conditional(backpatch_address, translation_ptr);
   }
 
-  /* Unconditionally generate translation targets. In case we hit one or
-     in the unlikely case that block was too big (and not finalized) */
-  generate_translation_gate(arm);
+  /* The translation gate, for a block that can run off its end (a gate
+     target, MAX_BLOCK_SIZE, MAX_EXITS, the special PCs, a conditional or
+     non-branching last instruction); none after one that always leaves
+     (core-13, arm_block_end_exits). */
+  if(!block_end_exits)
+  {
+    generate_translation_gate(arm);
+  }
+  else
+  {
+    generate_translation_gate_skipped();
+  }
 
   for(i = 0; i < block_exit_position; i++)
   {
@@ -3156,9 +3820,11 @@ bool translate_block_arm(u32 pc, bool ram_region)
     }
     else
     {
-      /* Deferred patch list must match arm_emit.h: only PCs emitted as direct
-       * PC-relative branches get patched here. Partial: BIOS + cart ROM only.
-       * Classic: same plus IW/EW RAM (lookup never returns (u8*)~0 for these). */
+      /* Linked directly (patched once the target is translated): BIOS and
+       * cart ROM; with Classic SMC also IW/EW RAM, as a full flush drops
+       * every block on a RAM write. Partial SMC drops only the written
+       * block, so a direct link into RAM code could run stale code: those
+       * exits go through the PC lookup below. */
 #if defined(NSPIRE_LIBRETRO)
       if ((nspire_dynarec_ram_policy
             && GPSP_PC_RELATIVE_TRANS_REGION(branch_target))
@@ -3177,8 +3843,21 @@ bool translate_block_arm(u32 pc, bool ram_region)
          block_exits[i].branch_source;
         external_block_exit_position++;
       }
+      else
+      {
+        /* Not linked: the branch looks its target up by PC, as BX does.
+         * Its placeholder (B +0) would run the next host instructions
+         * instead, so Partial SMC froze or crashed games whose IWRAM code
+         * branches between its blocks (Pokemon Emerald at boot). */
+        generate_branch_patch_unconditional(block_exits[i].branch_source,
+         translation_ptr);
+        generate_update_pc(branch_target);
+        generate_indirect_branch_no_cycle_update(arm);
+      }
     }
   }
+
+  generate_block_tails();
 
   if (ram_region)
     ram_translation_ptr = translation_ptr;
@@ -3203,6 +3882,8 @@ bool translate_block_arm(u32 pc, bool ram_region)
       external_block_exits[i].branch_source, translation_target);
   }
 
+  RAM_KEEP_RECORD(0);
+  RAM_TRACE_DONE(0);
   return true;
 }
 
@@ -3227,6 +3908,7 @@ bool translate_block_thumb(u32 pc, bool ram_region)
   u8 *translation_cache_limit = NULL;
   s32 i;
   u32 flag_status;
+  u32 block_end_exits = 0;
   block_exit_type external_block_exits[MAX_EXITS];
   generate_block_extra_vars_thumb();
   thumb_fix_pc();
@@ -3234,6 +3916,9 @@ bool translate_block_thumb(u32 pc, bool ram_region)
   if(!pc_address_block)
     pc_address_block = load_gamepak_page(pc_region & 0x3FF);
 
+  mem_pc_settle();
+  RAM_KEEP_START(1);
+  RAM_KEEP_TRY(1);
   if (ram_region) {
     translation_ptr = ram_translation_ptr;
     translation_cache_limit = &ram_translation_cache[
@@ -3246,6 +3931,7 @@ bool translate_block_thumb(u32 pc, bool ram_region)
   }
 
   generate_block_prologue();
+  generate_block_tails_start();
 
   /* This is a function because it's used a lot more than it might seem (all
      of the data processing functions can access it), and its expansion was
@@ -3271,6 +3957,8 @@ bool translate_block_thumb(u32 pc, bool ram_region)
        thumb_instruction_width].update_cycles = 1;
     }
   }
+  RAM_KEEP_SCANNED(thumb_instruction_width);
+  RAM_TRACE_SCANNED(thumb_instruction_width);
 
   thumb_dead_flag_eliminate();
 
@@ -3296,8 +3984,9 @@ bool translate_block_thumb(u32 pc, bool ram_region)
        a simple recursive call here won't work, it has to pedal out to
        the beginning. */
 
-    if(translation_ptr > translation_cache_limit)
-    {
+    RAM_KEEP_FULL_CHECK();
+    if(translation_ptr + block_tails_bytes > translation_cache_limit ||
+     mem_pc_full(ram_region, translation_ptr)) {
       if (ram_region)
         flush_translation_cache_ram();
       else
@@ -3314,9 +4003,17 @@ bool translate_block_thumb(u32 pc, bool ram_region)
     }
   }
 
-  /* Unconditionally generate translation targets. In case we hit one or
-     in the unlikely case that block was too big (and not finalized) */
-  generate_translation_gate(thumb);
+  /* The translation gate, for a block that can run off its end; none after
+     one whose last instruction always leaves (core-13,
+     thumb_block_end_exits). */
+  if(!block_end_exits)
+  {
+    generate_translation_gate(thumb);
+  }
+  else
+  {
+    generate_translation_gate_skipped();
+  }
 
   for(i = 0; i < block_exit_position; i++)
   {
@@ -3352,8 +4049,21 @@ bool translate_block_thumb(u32 pc, bool ram_region)
          block_exits[i].branch_source;
         external_block_exit_position++;
       }
+      else
+      {
+        /* Not linked: the branch looks its target up by PC, as BX does.
+         * Its placeholder (B +0) would run the next host instructions
+         * instead, so Partial SMC froze or crashed games whose IWRAM code
+         * branches between its blocks (Pokemon Emerald at boot). */
+        generate_branch_patch_unconditional(block_exits[i].branch_source,
+         translation_ptr);
+        generate_update_pc(branch_target);
+        generate_indirect_branch_no_cycle_update(thumb);
+      }
     }
   }
+
+  generate_block_tails();
 
   if (ram_region)
     ram_translation_ptr = translation_ptr;
@@ -3378,6 +4088,8 @@ bool translate_block_thumb(u32 pc, bool ram_region)
       external_block_exits[i].branch_source, translation_target);
   }
 
+  RAM_KEEP_RECORD(1);
+  RAM_TRACE_DONE(1);
   return true;
 }
 
@@ -3387,24 +4099,16 @@ void init_bios_hooks(void)
   // SWI calls from ROM and RAM regardless of cache flushes.
   rom_translation_ptr = &rom_translation_cache[rom_cache_watermark];
   last_rom_translation_ptr = rom_translation_ptr;
+  mem_pc_bios_start();
   bios_swi_entrypoint = block_lookup_address_arm(0x8);
   rom_cache_watermark = (u32)(rom_translation_ptr - rom_translation_cache);
+  mem_pc_bios_end();
 }
 
-void flush_translation_cache_ram(void)
+/* The GBA's part of a RAM flush: every tag cleared (as little memory as
+   the code's bounds allow), the bounds and the tags' numbering reset. */
+static void flush_ram_tags(void)
 {
-#ifdef NSPIRE_LIBRETRO
-  u8 *ram_jit_hi = ram_translation_ptr;
-#endif
-  /* Flushes RAM caches avoiding doing too much work (ie. wiping unused memory) */
-  flush_ram_count++;
-  /*printf("ram flush %d (pc %x), %x to %x, %x to %x\n",
-   flush_ram_count, reg[REG_PC], iwram_code_min, iwram_code_max,
-   ewram_code_min, ewram_code_max);*/
-
-  last_ram_translation_ptr = ram_translation_cache;
-  ram_translation_ptr = ram_translation_cache;
-
   // Proceed to clean the SMC area if needed
   // (also try to memset as little as possible for performance)
   if (iwram_code_max) {
@@ -3430,6 +4134,27 @@ void flush_translation_cache_ram(void)
   ewram_code_min = ~0U;
   ewram_code_max =  0U;
   ram_block_tag = INITIAL_TOP_TAG;
+}
+
+void flush_translation_cache_ram(void)
+{
+#ifdef NSPIRE_LIBRETRO
+  u8 *ram_jit_hi = ram_translation_ptr;
+#endif
+  /* Flushes RAM caches avoiding doing too much work (ie. wiping unused memory) */
+  flush_ram_count++;
+  /*printf("ram flush %d (pc %x), %x to %x, %x to %x\n",
+   flush_ram_count, reg[REG_PC], iwram_code_min, iwram_code_max,
+   ewram_code_min, ewram_code_max);*/
+
+  last_ram_translation_ptr = ram_translation_cache + NSPIRE_RAM_CACHE_START;
+  ram_translation_ptr = ram_translation_cache + NSPIRE_RAM_CACHE_START;
+  mem_pc_flush_ram();
+
+  flush_ram_tags();
+#ifdef NSPIRE_KEEP_TRACE
+  ram_trace_event(0xF1000000);
+#endif
 #ifdef NSPIRE_LIBRETRO
   /* Legacy gpSP invalidated the JIT buffer; I-cache may retain stale code. */
   if (ram_jit_hi > ram_translation_cache)
@@ -3437,16 +4162,380 @@ void flush_translation_cache_ram(void)
 #endif
 }
 
+#if defined(NSPIRE_BUILD) && defined(ARM_ARCH)
+/* speed10b: the flush of an SMC store (arm_stub.S's stores' path and
+   write_epilogue): the whole flush (the kept blocks' store stays: what
+   they were made from is checked when one is copied); with Partial SMC the
+   first one starts the keeping. */
+void nspire_ram_flush_smc(void)
+{
+  if (RAM_KEEP_ON)
+    ram_keep_armed = 1;
+  flush_translation_cache_ram();
+}
+
+/* RAM_KEEP_START's: the store kept clear of the tag table's next entry
+   (each new tag's, written by the lookup before it translates) and of this
+   block's first instruction; the counts started. */
+static __attribute__((noinline)) void ram_keep_begin(void)
+{
+#ifdef NSPIRE_KEEP_CHECK
+  /* a copy or a flush expected, and the translation ended neither way:
+     it failed (a copy was predicted) or flushed (as predicted) */
+  if (ram_keep_expect == 1)
+  {
+    if (nspire_keep_check_bad < 8)
+      fprintf(stderr, "kept-block check: %08x predicted to fit, its translation flushed\n",
+              (unsigned)ram_keep_made.key);
+    nspire_keep_check_bad++;
+  }
+  else if (ram_keep_expect == 2)
+    nspire_keep_check_flush_ok++;
+  ram_keep_expect = 0;
+#endif
+  nspire_reloc_n = 0;
+  ram_keep_need = 0;
+  ram_keep_need_pcs = 0;
+  if (ram_keep_tags_low() - sizeof(ramtag_type) <
+       &ram_translation_cache[RAM_KEEP_HI] ||
+      ram_translation_ptr + RAM_KEEP_MARGIN > &ram_translation_cache[RAM_KEEP_LO])
+    ram_keep_clear();
+}
+
+/* After the scan and the internal targets: what the translation will
+   leave in block_data[].update_cycles, and whether it read the last
+   instruction's as the scan found it. scan_block resets an instruction's
+   update_cycles only after its exit tests, so a block whose last
+   instruction ends the scan there (an exit, a gate) keeps that entry as an
+   earlier translation left it, and the translate loop reads it (the cycle
+   update before the last instruction): the code depends on it. */
+static __attribute__((noinline)) void ram_keep_scanned(u32 start, u32 end, u32 width,
+ s32 exits, s32 scanned)
+{
+  u32 kn = (end - start) / width, ki, klast = 0;
+  for (ki = 0; ki < (u32)exits; ki++)
+    if (block_exits[ki].branch_target == end - width && end - width > start)
+      klast = 1;
+  ram_keep_n = kn;
+  ram_keep_dep = scanned == (s32)kn - 1 && !klast;
+  for (ki = 0; ki < (kn + 31) / 32; ki++)
+    ram_keep_bits_now[ki] = 0;
+  for (ki = 0; ki < kn; ki++)
+    ram_keep_bits_now[ki >> 5] |= (u32)(block_data[ki].update_cycles & 1) << (ki & 31);
+}
+
+/* With translate_block_*'s check after each instruction: the most room
+   and PC entries it has needed (it fails when start + need passes the
+   limit or the entries the table's size), and the store kept clear of the
+   code. */
+static __attribute__((noinline)) void ram_keep_full(u8 *ptr, u8 *start, u32 pcs0)
+{
+  u32 need = (ptr - start) + block_tails_bytes;
+  u32 need_pcs = (nspire_pcs.ram_count - pcs0) + nspire_block_tail_bytes / 4;
+  if (need > ram_keep_need)
+    ram_keep_need = need;
+  if (need_pcs > ram_keep_need_pcs)
+    ram_keep_need_pcs = need_pcs;
+  if (ptr + block_tails_bytes + RAM_KEEP_MARGIN >
+       &ram_translation_cache[RAM_KEEP_LO])
+    ram_keep_clear();
+}
+
+#ifdef NSPIRE_KEEP_CHECK
+/* The block just translated against what the copy made there
+   (ram_keep_check_copy): the same bytes, PC entries, tags, code bounds,
+   scratch left, instructions and scratch read, room needed. */
+static void ram_keep_check(u32 key, u8 *code_lo, u32 pcs0)
+{
+  u32 size = ram_translation_ptr - code_lo, i, pc, start = key & ~1U;
+  u32 width = (key & 1) ? 2 : 4;
+  const char *why = NULL;
+
+  if (ram_keep_made.key != key || code_lo != ram_keep_made.at)
+    why = "key or place";
+  else if (ram_keep_made.size != size)
+    why = "size";
+  else if (memcmp(code_lo, ram_keep_made.code, size))
+    why = "code";
+  else if (ram_keep_made.pcs != nspire_pcs.ram_count - pcs0)
+    why = "PC entries' count";
+  else if (ram_keep_made.n != ram_keep_n || ram_keep_made.dep != ram_keep_dep)
+    why = "instructions or scratch read";
+  else if (ram_keep_made.need != ram_keep_need ||
+           ram_keep_made.need_pcs != ram_keep_need_pcs)
+    why = "room needed";
+  for (i = 0; !why && i < ram_keep_made.pcs; i++)
+  {
+    const nspire_mem_pc_type *x = &nspire_pcs.ram[pcs0 + i];
+    if (x->host - (u32)code_lo != ram_keep_made.pc[i].host ||
+        x->pc != ram_keep_made.pc[i].pc)
+      why = "PC entries";
+  }
+  for (pc = start, i = 0; !why && pc < ram_keep_made.end; pc += width, i++)
+  {
+    u8 *t = pc >= 0x03000000 ? &iwram[pc & 0x7FFF] :
+                               &ewram[0x40000 + (pc & 0x3FFFF)];
+    if ((width == 4 ? address32(t, 0) : address16(t, 0)) != ram_keep_made.tags[i])
+      why = "tags";
+  }
+  if (!why && (ram_keep_made.bounds[0] != iwram_code_min ||
+               ram_keep_made.bounds[1] != iwram_code_max ||
+               ram_keep_made.bounds[2] != ewram_code_min ||
+               ram_keep_made.bounds[3] != ewram_code_max))
+    why = "code bounds";
+  for (i = 0; !why && i < 1024; i++)
+    if (block_data[i].update_cycles != ram_keep_made.scratch[i])
+      why = "scratch left";
+  if (!why)
+    nspire_keep_check_ok++;
+  else
+  {
+    if (nspire_keep_check_bad < 8)
+      fprintf(stderr, "kept-block check: %08x %08x-%08x at +%u: %s differ\n",
+              (unsigned)key, (unsigned)start, (unsigned)ram_keep_made.end,
+              (unsigned)(code_lo - ram_translation_cache), why);
+    nspire_keep_check_bad++;
+  }
+}
+#endif
+
+/* The block made (not copied): checked (KEEP_CHECK), or kept. */
+static __attribute__((noinline)) void ram_keep_end(u32 key, u32 end, u8 *code_lo,
+ u32 pcs0, u32 ctx0, u32 found)
+{
+  u32 start = key & ~1U, len = end - start, n = ram_keep_n, size, i, pos;
+  u32 code_size = ram_translation_ptr - code_lo, cands = 0, relocs = 0;
+  u32 npcs = nspire_pcs.ram_count - pcs0, mirror = start >= 0x03000000 ?
+   ~0x7FFFU : ~0x3FFFFU;
+  ram_keep_ent *e;
+  u32 *bits, *pcs, *code;
+  u16 *rel;
+  u32 slot = ram_keep_slot(key);
+#ifdef NSPIRE_KEEP_CHECK
+  if (ram_keep_expect == 1)
+    ram_keep_check(key, code_lo, pcs0);
+  else if (ram_keep_expect == 2)
+  {
+    if (nspire_keep_check_bad < 8)
+      fprintf(stderr, "kept-block check: %08x predicted to flush, its translation didn't\n",
+              (unsigned)key);
+    nspire_keep_check_bad++;
+    nspire_keep_check_flush_bad++;
+  }
+  ram_keep_expect = 0;
+#endif
+  /* one there already; a ROM flush while its exits were linked; a span
+     across a mirror's end (the bytes compared wouldn't be the ones read);
+     more branches than the log holds */
+  if (found || ctx0 != ram_keep_ctx || ((start ^ (end - 1)) & mirror) ||
+      nspire_reloc_n > NSPIRE_RELOC_MAX || code_size / 4 > 0xFFFF)
+    return;
+  /* the store clear of the code and of the tag table's next entry */
+  if (ram_translation_ptr + RAM_KEEP_MARGIN > &ram_translation_cache[RAM_KEEP_LO] ||
+      ram_keep_tags_low() - sizeof(ramtag_type) < &ram_translation_cache[RAM_KEEP_HI])
+    return;
+  for (i = 0; i < nspire_reloc_n; i++)
+    if (nspire_reloc[i] - (u32)code_lo < code_size)
+      cands++;
+  size = sizeof(ram_keep_ent) + ((len + 3) & ~3U) + (n + 31) / 32 * 4 +
+   npcs * 8 + ((cands + 1) & ~1U) * 2 + code_size;
+  if (size > RAM_KEEP_CAP / 4)
+    return;
+  /* (positions compare modulo 2^32: the store starts over at 2^31) */
+  if (ram_keep_w >= 0x80000000u)
+  {
+    ram_keep_clear();
+    ram_keep_w = 0;
+    ram_keep_v = 0;
+    memset(ram_keep_table, 0, RAM_KEEP_SLOTS * 4);
+#if defined(NSPIRE_KEEP_CHECK) || defined(NSPIRE_KEEP_TRACE)
+    nspire_keep_w_resets++;
+#endif
+  }
+  pos = ram_keep_w;
+  if ((pos & (RAM_KEEP_CAP - 1)) + size > RAM_KEEP_CAP)
+    pos += RAM_KEEP_CAP - (pos & (RAM_KEEP_CAP - 1));   /* (the ring's start) */
+  e = ram_keep_at(pos);
+  e->key = key;
+  e->end = end;
+  e->code_at = (u32)code_lo;
+  e->code_size = code_size;
+  e->need = ram_keep_need;
+  e->need_pcs = ram_keep_need_pcs;
+  e->n = n;
+  e->dep = ram_keep_dep;
+  e->pcs = npcs;
+  memcpy(e + 1, ram_keep_bytes(start), len);
+  bits = ram_keep_ent_bits(e);
+  for (i = 0; i < (n + 31) / 32; i++)
+    bits[i] = ram_keep_bits_now[i];
+  pcs = ram_keep_ent_pcs(e);
+  for (i = 0; i < npcs; i++)
+  {
+    pcs[2 * i] = nspire_pcs.ram[pcs0 + i].host - (u32)code_lo;
+    pcs[2 * i + 1] = nspire_pcs.ram[pcs0 + i].pc;
+  }
+  /* the branches out of the block (each place once, rising) */
+  e->relocs = 0;
+  rel = ram_keep_ent_relocs(e);
+  for (i = 0; i < nspire_reloc_n; i++)
+  {
+    u32 at = nspire_reloc[i], w, target, k, idx;
+    if (at - (u32)code_lo >= code_size || (at & 3))
+      continue;
+    w = *(u32 *)at;
+    if (((w >> 25) & 7) != 5)
+      continue;
+    target = at + 8 + ((s32)(w << 8) >> 6);
+    if (target - (u32)code_lo <= code_size)
+      continue;   /* (in the block: the same distance anywhere) */
+    idx = (at - (u32)code_lo) >> 2;
+    for (k = relocs; k && rel[k - 1] > idx; k--)
+      ;
+    if (k && rel[k - 1] == idx)
+      continue;
+    memmove(&rel[k + 1], &rel[k], (relocs - k) * 2);
+    rel[k] = idx;
+    relocs++;
+  }
+  e->relocs = relocs;
+  code = ram_keep_ent_code(e);
+  memcpy(code, code_lo, code_size);
+  e->size = (u8 *)code + code_size - (u8 *)e;
+  e->next = ram_keep_table[slot];
+  ram_keep_table[slot] = pos + 1;
+  ram_keep_w = pos + e->size;
+}
+#endif
+
+#if defined(NSPIRE_KEEP_CHECK) || defined(NSPIRE_KEEP_TRACE)
+/* tests/arm (perf keepw=N): the store's positions from N on (empty), so
+   that a run crosses 2^31 */
+void nspire_keep_test_w(u32 w)
+{
+  ram_keep_w = w;
+  ram_keep_v = w;
+}
+#endif
+
+#ifdef NSPIRE_KEEP_TRACE
+/* tests/arm KEEP_TRACE=1: a hash of the events that decide what the RAM
+   cache's code is (each block made: its tag and mode, PC, end, bytes and
+   the scratch bit read; each flush), kept as made with and without the
+   keeping; and as each frame ends (nspire_keep_trace), the cache's code
+   and tables. A block made again from the same inputs for the same tag
+   and mode (a tag's offset 0) is no new event. */
+static u32 ram_trace_hash = 2166136261u, ram_trace_events;
+static u32 ram_trace_n, ram_trace_dep, ram_trace_bit;
+static u32 ram_trace_map[0x10000];
+
+static u32 ram_trace_mix(u32 h, u32 v)
+{
+  return (h ^ v) * 16777619u;
+}
+
+static void ram_trace_event(u32 v)
+{
+  ram_trace_hash = ram_trace_mix(ram_trace_hash, v);
+  ram_trace_events++;
+}
+
+static void ram_trace_scanned(u32 start, u32 end, u32 width, s32 exits, s32 scanned)
+{
+  u32 kn = (end - start) / width, ki, klast = 0;
+  for (ki = 0; ki < (u32)exits; ki++)
+    if (block_exits[ki].branch_target == end - width && end - width > start)
+      klast = 1;
+  ram_trace_n = kn;
+  ram_trace_dep = scanned == (s32)kn - 1 && !klast;
+  ram_trace_bit = block_data[kn - 1].update_cycles & 1;
+}
+
+static void ram_trace_made(u32 key, u32 end, u32 n, u32 dep, u32 bit)
+{
+  u32 pc = key & ~1U, h = 2166136261u, a, i;
+  u16 *tagp = pc >= 0x03000000 ? (u16 *)&iwram[pc & 0x7FFF] :
+                                 (u16 *)&ewram[0x40000 + (pc & 0x3FFFF)];
+  u8 *bytes = pc >= 0x03000000 ? &iwram[0x8000] : ewram;
+  u32 mask = pc >= 0x03000000 ? 0x7FFF : 0x3FFFF;
+  h = ram_trace_mix(h, key);
+  h = ram_trace_mix(h, end);
+  h = ram_trace_mix(h, n);
+  h = ram_trace_mix(h, dep ? 2 + bit : 0);
+  for (a = pc; a != end; a++)
+    h = ram_trace_mix(h, bytes[a & mask]);
+  if (!VALID_TAG(*tagp))
+  {
+    ram_trace_event(h ^ 0xBAD);
+    return;
+  }
+  i = ((INITIAL_TOP_TAG - *tagp) / 2) * 2 + (key & 1);
+  if (i < 0x10000 && ram_trace_map[i] == h)
+    return;
+  if (i < 0x10000)
+    ram_trace_map[i] = h;
+  ram_trace_event(ram_trace_mix(h, *tagp));
+}
+
+static void ram_trace_done(u32 key, u32 end)
+{
+  ram_trace_made(key, end, ram_trace_n, ram_trace_dep, ram_trace_bit);
+}
+
+/* tests/arm perf (KEEP_TRACE=1), as each frame ends */
+void nspire_keep_trace(char *text, u32 size)
+{
+  u32 tags = 2166136261u, code = 2166136261u, i;
+  u32 lo = RAM_TRANSLATION_CACHE_SIZE - (0x10000 - ram_block_tag) / 2 *
+   sizeof(ramtag_type);
+  for (i = 0; i < 0x8000; i += 4)
+    tags = ram_trace_mix(tags, *(u32 *)&iwram[i]);
+  for (i = 0; i < 0x40000; i += 4)
+    tags = ram_trace_mix(tags, *(u32 *)&ewram[0x40000 + i]);
+  tags = ram_trace_mix(tags, iwram_code_min);
+  tags = ram_trace_mix(tags, iwram_code_max);
+  tags = ram_trace_mix(tags, ewram_code_min);
+  tags = ram_trace_mix(tags, ewram_code_max);
+  tags = ram_trace_mix(tags, ram_block_tag);
+  for (i = NSPIRE_RAM_CACHE_START;
+       &ram_translation_cache[i] < ram_translation_ptr; i += 4)
+    code = ram_trace_mix(code, *(u32 *)&ram_translation_cache[i]);
+  code = ram_trace_mix(code, ram_translation_ptr - ram_translation_cache);
+  for (i = lo; i < RAM_TRANSLATION_CACHE_SIZE; i += 4)
+    code = ram_trace_mix(code, *(u32 *)&ram_translation_cache[i]);
+  code = ram_trace_mix(code, nspire_pcs.pending & 1);
+  for (i = 0; !(nspire_pcs.pending & 1) && i < nspire_pcs.ram_count; i++)
+  {
+    code = ram_trace_mix(code, nspire_pcs.ram[i].host - (u32)ram_translation_cache);
+    code = ram_trace_mix(code, nspire_pcs.ram[i].pc);
+  }
+  snprintf(text, size, "keep-trace: blocks %08x (%u), tags %08x, cache %08x, flushes %u",
+           (unsigned)ram_trace_hash, (unsigned)ram_trace_events, (unsigned)tags,
+           (unsigned)code, (unsigned)nspire_pcs.ram_flushes);
+}
+#endif
+
 void flush_translation_cache_rom(void)
 {
+#if defined(NSPIRE_BUILD) && defined(ARM_ARCH)
+  /* speed10b: kept RAM blocks link into the ROM blocks */
+  ram_keep_ctx++;
+#if defined(NSPIRE_KEEP_CHECK) || defined(NSPIRE_KEEP_TRACE)
+  if (ram_keep_v != ram_keep_w)
+    nspire_keep_rom_clears++;
+#endif
+  ram_keep_clear();
+#endif
 #ifdef NSPIRE_LIBRETRO
   u8 *rom_jit_hi = rom_translation_ptr;
 #endif
   /* We flush the generated code except for everything below the watermark. */
   last_rom_translation_ptr = &rom_translation_cache[rom_cache_watermark];
   rom_translation_ptr      = &rom_translation_cache[rom_cache_watermark];
+  mem_pc_flush_rom();
 
   memset(rom_branch_hash, 0, sizeof(rom_branch_hash));
+  block_cache_clear();
 #ifdef NSPIRE_LIBRETRO
   {
     u8 *rom_jit_lo = &rom_translation_cache[rom_cache_watermark];
@@ -3461,8 +4550,16 @@ void init_dynarec_caches(void)
   /* Initialize caches so that we can start initalizing the emitter. */
   rom_translation_ptr = last_rom_translation_ptr = &rom_translation_cache[0];
   memset(rom_branch_hash, 0, sizeof(rom_branch_hash));
+  block_cache_clear();
+  mem_pc_init();
 
-  ram_translation_ptr = last_ram_translation_ptr = &ram_translation_cache[0];
+  ram_translation_ptr = last_ram_translation_ptr = &ram_translation_cache[NSPIRE_RAM_CACHE_START];
+#if defined(NSPIRE_BUILD) && defined(ARM_ARCH)
+  ram_keep_w = 0;
+  ram_keep_v = 0;
+  ram_keep_armed = 0;
+  memset(ram_keep_table, 0, RAM_KEEP_SLOTS * 4);
+#endif
   memset(iwram, 0, 0x8000);
   memset(&ewram[0x40000], 0, 0x40000);
 
@@ -3563,6 +4660,9 @@ static void partial_flush_ram_inner(u32 address, int register_dynamic_gate)
 
   smc_data_right = smc_data;
   *((u16 *)smc_data) = 0;
+#ifdef NSPIRE_KEEP_TRACE
+  ram_trace_event(0xF2000000 ^ address);
+#endif
 
   if (register_dynamic_gate)
     translation_gate_try_register(address);

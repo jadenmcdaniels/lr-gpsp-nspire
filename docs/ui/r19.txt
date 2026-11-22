@@ -1,0 +1,227 @@
+gpSP for the TI-Nspire: the interface as of r19 (2026-11-21)
+=============================================================
+
+This file says what changed against docs/ui/spec.txt (r16-r18) and is the reference for the PC tests'
+scripts. The code: gui.c (what the keys do), nspire_ui_screens.c (what is drawn), nspire_ui.c (the kit).
+
+What r19 changed, in short: capitals only; a game's title that scrolls smoothly and comes round again; fewer
+settings; the calculator's keypad drawn with each key's binding where it is; a path at the top of every page
+that says how deep it is; the folders reached from the games themselves; one press from GAMES to QUIT; 7 9 1 3
+doing nothing unless the player binds them; the volume in 20 steps (0/20 to 20/20); a setting with few values
+changed by one press; one screen instead of a screen each for the games, the settings, the folders and quitting;
+and every name under a picture saying what the picture is.
+
+1. ONE SCREEN
+-------------
+(The first r19 had a row of seven tabs. It became one screen of items, each a picture with one name, a selector
+in the top row, and the folders among the items instead of a menu of their own.)
+
+Every top-level screen has the same top row (ui_nav, baseline 18): a word in each corner and the selector
+between them, centred:
+
+    with a game paused    SETTINGS            SAVES  GAMES            QUIT      (words 0-3)
+    without a game        SETTINGS               GAMES                QUIT      (words 0-2)
+
+Under it, the picked word's things; at the bottom, the band. There is no Resume, Save, Load, Link or Folders
+tab and no screen of their own for any of them.
+
+    GAMES      the games as items: a grid three by two, each a picture (its newest save's) with one name
+               centred under it; after the games, the folders as items too (this folder's, "USB DRIVE" when
+               there is one, "BACK" the way up, last): a folder's name with a slash ("GBC/"; USB DRIVE and
+               BACK without one), no picture. v: a line an item.
+    SAVES      the paused game's saves, the same grid: RESUME (the game as it stands), SAVE (a "+"), the game's
+               own save ("IN-GAME SAVE", when it has one), then every state, the newest first.
+    SETTINGS   the settings themselves: tiles three across, each a name over its value (VOLUME over 14/20), and
+               at their end the screens that are lists (KEYS, BLUETOOTH) and MORE. No pages between (an earlier
+               r19 had nine pages of a few tiles each).
+    QUIT       one line: what quitting does to the game ("THE GAME IS SAVED FIRST.").
+
+The arrows are either ON THE TOP ROW or IN THE BODY under the picked word. One black block on the screen says
+where: on the row the picked word is the block (every word black); in the body the picked thing's name is the
+block, its word in the row black and the others grey. The item the body is on stays in colour either way; the
+others are black and white.
+
+Keys, on the top row:
+    left / right   the word before / after, wrapping. What is under a word shows as soon as it is picked.
+    down, enter    into the body (GAMES, SAVES, SETTINGS); enter on QUIT quits gpSP.
+    esc, menu      with a game: back to the game. Without one: the block goes to QUIT (no key quits by itself).
+Keys, in the body:
+    up from the top row of items     back to the top row
+    esc, menu                        GAMES and SETTINGS: back to the top row. SAVES: back to the game at once (it
+                                     is the paused menu's first screen: menu, then menu or esc again, resumes)
+    GAMES      arrows move in the grid: left and right stop at the row's ends; down from the last row goes round
+               to the first; up from the first row goes to the top row. enter plays the game (shift held:
+               without resuming its last save) or opens the folder (the grid then shows that folder, the arrows
+               on its first item). S the picked game's saves (a page: section 2), V grid/lines, tab moves a game
+               among the games (shift+tab sorts A to Z), U the USB drive.
+    SAVES      arrows as GAMES', but nothing wraps. enter on RESUME goes back to the game; on SAVE saves (to a
+               new slot, or the same one: Settings > Saving > Save to) and goes back to the game; on a state
+               loads it; on IN-GAME SAVE restarts the game from its own save. S on a state saves over it (after
+               a question); S on RESUME or SAVE saves as SAVE does. D deletes (after a question, unless
+               Confirm delete is off; del is the GBA's A as the keys come, so it is enter here as in every menu;
+               a del that isn't a button's key deletes too), M marks (held: sweeps), A all, C/U pack/unpack, T
+               copies to the other place, tab switches the place (calculator / USB drive) while a drive is in.
+               After a question or a save that didn't happen the arrows are back on the tile they were on.
+    SETTINGS   arrows move among the tiles (left and right: the one before or after, in order, going round;
+               up and down: the row above or below, down from the last going round; up from the first row: the
+               top row). enter changes the picked setting (section 3) or opens its screen; esc: the top row.
+               Coming back into the tiles, the arrows are on the tile they left. The tiles, in order: VOLUME,
+               BRIGHTNESS, SCREEN SIZE, FPS COUNTER, AUTOSAVE, KEYS, CONTROLLER, (BLUETOOTH: builds with it),
+               (LINK: with a game), (CHEATS: a game with codes), MORE: eleven at most, four rows of three, so
+               the screen never scrolls.
+
+How gpSP opens: without a game, GAMES with the arrows in the grid, its first item picked. The menu key in a
+game: SAVES with the arrows in its tiles, RESUME picked (enter, esc or menu go back to the game; right, enter
+saves).
+
+What the PC tests see (ui_shown): "main:N" whenever the arrows are on the top row (N the word's place: with a
+game SETTINGS 0, SAVES 1, GAMES 2, QUIT 3; without one SETTINGS 0, GAMES 1, QUIT 2); "Settings:K" with the
+arrows in Settings' tiles and "More:K" on its one page (K the picked tile's place among the tiles shown);
+"list:K" in GAMES' grid (K the picked item's place: the games first, then the folders);
+"saves:K" in SAVES' tiles and on a game's saves page (K the picked tile: with a game paused RESUME 0, SAVE 1,
+then the game's own save if it has one, then the states); "Cheats:K"; "dialog:K", "keys:K" as before. The
+About page is "About:0".
+
+2. THE BAND, THE TILES AND THE HEADER
+-------------------------------------
+A tile is a picture (96 x 64, at x 8 / 112 / 216, rows from 30 and 126) and one name under it, centred, in
+the bold weight; the picked one's name is white on a block as wide as the tile and 4 more either side (rows
+65-82 under the picture's top). A name too long is cut ("..."), still centred; picked, it runs round: after a
+second it moves left a pixel at a time (30 px a second) and comes in again from the right after a gap of 24 px
+(ui_line_text, ui_scroll_after(ms, period)). A marked save says so in its name ("SLOT 4 MARKED").
+
+The band (rows 222-239), on a screen of items: at its left what the picked item is, in the regular weight (a
+game: "4 SAVES . 2 H", "NOT PLAYED"; a folder: "FOLDER", or "UP FROM <path>"; a state: "2 HOURS AGO . 13 KB";
+RESUME: the game's name; SAVE: "TO SLOT 5"); at its right, before the battery, the one or two keys a player
+needs there (the key bold, what it does regular): a game "S SAVES"; a state "S SAVE  D DELETE" (with a drive
+in, "TAB USB DRIVE" too); on a game's saves page "D DELETE  M MARK". enter is never said, and V, tab, C, U, T
+work without being said (the README lists them). What just happened takes the whole band instead ("DELETED 1
+(13 KB).", "SLOT 3 IS EMPTY.").
+Elsewhere the band is: what just happened, else the picked setting's one sentence, else the keys.
+The battery ("82%") is the band's right end on every screen.
+
+A page (anything opened from the body) has a path where the top row was: "SETTINGS / KEYS", "SETTINGS / MORE",
+"SETTINGS / MORE / ABOUT", "SETTINGS / CONTROLLER / DETAILS", "SETTINGS / MORE / GAMES", "<GAME> /
+SAVES" (another game's saves, from GAMES' S): the steps before the last in grey, the last black.
+
+Text: capitals only (ui_text maps a-z to A-Z, whatever the code passes). One size, two weights. The left edge
+is x 8 (UI_MARGIN). A list's picked line (the keys' list, Bluetooth's devices, the games' lines) is a block
+from x 4 to 315.
+
+3. SETTINGS
+-----------
+One screen under the top row, and one page behind its last tile (MORE). Neither scrolls. Every choice that only
+decided speed is made for the player (the fast one is the default) and has no tile.
+
+A tile is a name over its value, both centred; a tile that only opens something (KEYS, CONTROLLER, BLUETOOTH,
+MORE, ABOUT) is its name alone, in the tile's middle (no arrow after it). Three across. Changing a value:
+    a setting with up to four values    enter is the next value (one press: no edit state)
+    a range (more than four values)     enter puts the value between < >, left/right change it (stopping at the
+                                        ends), enter keeps it, esc puts it back
+SETTINGS, in order (a tile in brackets is shown only when it applies):
+    Volume (0/20-20/20, range; the band says what plays the sound) · Brightness (System, 1/10-10/10, range) ·
+    Screen size (Original/Fit/Stretch; the band says what the picked one is: "THE GBA'S OWN PIXELS, WITH A
+    BORDER." / "FILLS THE WIDTH. BARS ABOVE AND BELOW." / "FILLS THE SCREEN. A LITTLE TALLER.") · FPS counter
+    (Off/On/Detailed) · Autosave (Off, 30 s ... 30 min, range) ·
+    Keys · Controller · [Bluetooth] · [Link: its value the link's state (No cable/Ready/Waiting/Linked or
+    Player N/Swap ends/Controller in), enter links or unlinks] · [Cheats: N codes] · More
+MORE, in order:
+    Frame skip (Auto/Off; Manual, from an older file, shows until it is changed) · Save to (Same slot/New slot:
+    the save key's) · [Autosave to (Same slot/New slot): only with Autosave on] ·
+    [Saves on (Calculator/USB drive): with a drive] · Link device (Auto/Wireless/Cable/Cable, exact) ·
+    Settings for (All games/This game) · Keys for · [LCD fix (Off/On): older CX only] · [Game: Restart] ·
+    Saves: Manage · Games: Manage · About                                (Game: only with a game)
+    Saves: Manage opens the paused game's saves as a page (the save manager: mark, delete, pack, copy; the page
+    GAMES' S opens for any game); without a game it says "IN GAMES, PRESS S ON A GAME." and opens nothing.
+    Keys, Controller, Bluetooth, Cheats, the games' manager: screens of their own, as before.
+
+No tile, the value FIXED whatever a settings file says (nspire_config_fast, nspire_stubs.c; on the calculator
+always, in the PC build only with GPSP_HOST_FAST set, so that its tests can still drive the other modes through
+settings files): Flicker fix (off: no frame mixing), Compatibility (Fast), Fast forward's top speed (none).
+(Frame skip has its tile again, after a build that fixed it to Auto. The speed test is gone from the menu.)
+Fixed the other way, for the picture: Fit is drawn SMOOTHED (the sharp Fit, scaled_raw, becomes scaled_aspect)
+and Transparency is on.
+No tile, the value as the files have it (a new file: the default in brackets): Sound delay [Short], Sound output
+[Auto], BT quality [Auto], Turbo rate [15/s], CPU speed [Auto], Fast memory [on, CX II], Game clock [Auto], BIOS
+[gba_bios.bin when it is there], Auto resume [on], Save on quit [on], Ask before deleting [on], Link speed [Fast].
+CPU speed, Fast memory and Link speed still turn themselves down after a freeze, and stay down.
+Gone since r18 the same way: Skip up to, Skip pattern, Sprite limit, Compress saves, In-game save's time, ROM
+cache, the Sound switch (volume 0 is off) and Channels.
+Renamed since r18: Size -> Screen size (Small -> Original, Full -> Stretch), Show FPS -> FPS counter (On, with ms -> Detailed), New slot per save ->
+Save to, Link's Mode -> Link device (Wireless adapter -> Wireless, Link cable -> Cable).
+
+4. KEYS
+-------
+Settings > Keys: the list at the left (ten lines on the screen: Up Down Left Right A B L R Start Select Menu
+Fast forward, Save state, Load state, Load newest, Save & quit, Next slot, Prev slot, FPS counter, Restart
+game, Brightness up, Brightness down, then Reset keys), each with its key at the right ("NO KEY" in grey when
+it has none; nothing there when even that doesn't fit beside the name), and at the right the
+calculator's keypad drawn in type: a key that does nothing is its own name in grey, a bound key says what it
+does in black, the picked line's key is the black block. enter then a key sets it; del clears it; tab then a key
+sets a GBA button's turbo (said in the band: "TAB TURBO =+DEL"). With a controller in, left/right switch between
+the calculator's keys and the controller's (the controller's list is the whole width, no drawing).
+In a game 7 9 1 3 do nothing unless the player binds them (they were the diagonals). 8 5 4 6 stay Up Down Left
+Right by default; in the menus 8 2 5 4 6 still move as the arrows do.
+
+5. SOUND
+--------
+Volume is 0 to 20 (nspire_audio_volume; "14/20"; the default 14, as loud as the old 70%): Settings' first tile.
+There is no Sound page, and Sound delay, Sound output and BT quality have no tile (section 3). The * and / keys in a
+game step it by one ("VOLUME 15/20"). Settings files: word 3 bit 21 says bits 16-20 hold it; bits 4-7 keep half
+of it for older builds; a file without bit 21 gives twice its old 0-10. A game's own file: "volume20=N"; an old
+"audio_volume=N" is read as 2N.
+
+6. CHEATS
+---------
+(Cheats come from a file on the calculator or on a USB drive, and each code has a switch. Until r19 the engine
+was in the build and nothing loaded a code into it.)
+
+The file is RetroArch's .cht (cheatN_desc / cheatN_code / cheatN_enable lines; libretro-database has one a game).
+Its name is the game's (its file's name without ".gba"), in any case, then ".cht" or ".cht.tns"; a tag in
+brackets may come between ("Pokemon - Emerald Version (USA, Europe) (Code Breaker).cht"). It is looked for when
+the game starts, in this order: the game's own folder (the calculator's or the drive's), the calculator's
+zgpSP_files, then on a USB drive its top folder, "cheats" and "zgpSP_files". With no file loaded it is looked for
+again whenever Settings is drawn and a drive has come or gone since.
+
+The codes are CodeBreaker's ("XXXXXXXX YYYY", parts joined by "+" or spaces): the engine's (libretro-gpsp
+cheats.c). An Action Replay or GameShark code ("XXXXXXXX YYYYYYYY") or a mistyped one is left out and counted.
+At most 160 codes of a file are kept, and at most 20 are on at once.
+
+Settings shows a CHEATS tile only for a game whose file was found; its value is how many are on ("2 ON"). A
+file with no code the engine can run still has its tile, "NONE USABLE"; enter on it says "CODEBREAKER CODES ONLY:
+NONE HERE." in the band and opens nothing.
+enter opens the page (ui_shown "cheats:K", K the picked code): header "SETTINGS / CHEATS" with "2 ON" at its
+right; a line a code, its name at the left and ON or OFF at the right (OFF grey); ten lines on the screen, more
+scroll (a bar at the right). up/down move (going round), left/right move a screenful, enter turns the picked
+code on or off (a 21st: "20 CODES ON AT MOST. TURN ONE OFF FIRST."), esc goes back to Settings. The band: "FROM
+THE CALCULATOR." or "FROM THE USB DRIVE.", and "11 NOT SUPPORTED." when the file has codes the engine can't run.
+Which codes are on is kept in the file itself (its cheatN_enable lines, written back when the page is left and
+when the game is): there is no other file, and a file on a drive that has gone keeps its switches for the game
+that is running only.
+
+7. CONTROLLER
+-------------
+Settings > Controller is one list: a line a controller that is connected, its name at the left and USB or
+BLUETOOTH at the right; with none, one sentence ("NO CONTROLLER. PLUG ONE INTO THE USB PORT, OR PAIR ONE IN
+SETTINGS > BLUETOOTH."). No tiles and no word for the port's state: one list instead of four tiles, and no word
+that flips between states while the port looks for a device.
+When the port asks something of the player (a wrong cable end, no power, a device that isn't a controller) the
+sentence for it is under the list once the state has been the same for two seconds. The band: "ENTER RESTART
+USB  D DETAILS": enter restarts the port's power (what came of it is the header's note), D opens the details
+(the port's registers, for a report; there right gives the OS thirty seconds), esc goes back. ui_shown is
+"controller:<state>" on both.
+
+8. BLUETOOTH (r19-bt)
+---------------------
+Settings > Bluetooth: its switch and SEARCH two tiles, the devices a list under them (PAIRED, FOUND), a line a
+device: its name at the left, at the right what it is or what it is doing (CONTROLLER, HEADPHONES, OTHER, PAIRED,
+CONNECTED, PAIRING, CONNECTING) and, only when its signal is weak (the lowest two of four steps, under -75 dBm),
+" . WEAK" after it (the screens' middle dot between two facts). No "3/4": a signal step as a fraction told the
+player nothing. A line PAIRING or CONNECTING (the player's, waiting its turn or under way, or
+the last headphones' automatic reconnect): the band "ENTER STOP" (and "DEL FORGET" on a paired one); enter stops it
+("STOPPED." takes the band, the line found or paired again), enter again starts it again. ui_shown "bluetooth:K", K
+the picked line (the tiles 0 and 1, then the list's lines and headings).
+Bluetooth LE controllers (the Xbox Wireless Controller) are listed and connect as the others. An LE device that is
+not a controller: enter says "ONLY CONTROLLERS AND HEADPHONES CONNECT."; an LE controller on a dongle where LE does
+not work: its line's sentence and enter's, "THIS DONGLE CAN'T CONNECT LE CONTROLLERS." (the old "BLUETOOTH LE DEVICES
+AREN'T SUPPORTED." is gone).

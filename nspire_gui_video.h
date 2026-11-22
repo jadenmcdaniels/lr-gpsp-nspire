@@ -6,24 +6,14 @@ void update_screen(void);
 void init_video(void);
 void video_resolution_large(void);
 void video_resolution_small(void);
-void print_string(const char *str, u16 fg_color, u16 bg_color, u32 x, u32 y);
-void print_string_pad(const char *str, u16 fg_color, u16 bg_color, u32 x, u32 y, u32 pad);
-void print_string_ext(const char *str, u16 fg_color, u16 bg_color, u32 x, u32 y,
-                      void *_dest_ptr, u32 pitch, u32 pad, u32 h_offset, u32 height);
 void clear_screen(u16 color);
-void blit_to_screen(u16 *src, u32 w, u32 h, u32 x, u32 y);
 u16 *copy_screen(void);
 void flip_screen(void);
+/* Shows the menus' kit frame (nspire_landscape, 320x240 5:6:5, nspire_ui.c). */
+void flip_screen_ui(void);
 void video_write_mem_savestate(file_tag_type savestate_file);
 void video_read_savestate(file_tag_type savestate_file);
 
-void debug_screen_clear(void);
-void debug_screen_start(void);
-void debug_screen_end(void);
-void debug_screen_printf(const char *format, ...);
-void debug_screen_printl(const char *format, ...);
-void debug_screen_newline(u32 count);
-void debug_screen_update(void);
 
 extern u32 frame_speed;
 

@@ -34,6 +34,8 @@
   #define GBC_BASE_RATE_INT (16u * 1024u * 1024u)
 #endif
 
+#include "sound_steps.h"
+
 #define DIRECT_SOUND_INACTIVE         0
 #define DIRECT_SOUND_RIGHT            1
 #define DIRECT_SOUND_LEFT             2
@@ -50,6 +52,12 @@ typedef struct
    u32 buffer_index;
    u32 status;
    u32 volume_halve;
+#if defined(NSPIRE_NO_AUDIO) || defined(NSPIRE_RUNTIME_AUDIO)
+   /* nspire core-04: FIFO pops at step pops_step not yet applied to
+    * fifo_fractional / buffer_index (sound_flush_pops). Not in states. */
+   u32 pops;
+   fixed8_24 pops_step;
+#endif
 } direct_sound_struct;
 
 #define GBC_SOUND_INACTIVE            0
@@ -105,6 +113,14 @@ unsigned sound_timer(fixed8_24 frequency_step, u32 channel);
 /* (tick_delta * GBA_SOUND_FREQUENCY / GBC_BASE) as fixed16_16; no float. */
 fixed16_16 sound_tick_delta_to_buffer_ticks(u32 tick_delta);
 void sound_reset_fifo(u32 channel);
+void sound_select_wave_bank(u32 bank);
+#if defined(NSPIRE_NO_AUDIO) || defined(NSPIRE_RUNTIME_AUDIO)
+/* Applies the pops sound_timer only counted. Call it before anything reads
+ * or overwrites fifo_fractional / buffer_index (states, adjust_sound_buffer);
+ * main.c also calls sound_flush_all_pops once a frame. */
+void sound_flush_pops(direct_sound_struct *ds);
+void sound_flush_all_pops(void);
+#endif
 void render_gbc_sound();
 void init_sound();
 
@@ -112,9 +128,21 @@ bool sound_check_savestate(const u8 *src);
 unsigned sound_write_savestate(u8 *dst);
 bool sound_read_savestate(const u8 *src);
 
+#ifndef NSPIRE_NO_AUDIO
 u32 sound_read_samples(s16 *out, u32 frames);
+/* What sound_read_samples would read next (frames), where (nspire_audio_mix.h) */
+u32 sound_samples_ready(s16 **buffer, u32 *base);
+void sound_samples_taken(u32 frames);
+#endif
 
 void reset_sound(void);
+
+#ifdef NSPIRE_RUNTIME_AUDIO
+/* Frontend mute changes only PCM production, never emulated APU timing. */
+void sound_set_output_enabled(int enabled);
+void sound_discard_samples(void);
+extern u32 sound_output_generation; /* reset or state load: discard sink PCM too */
+#endif
 
 #ifdef NSPIRE_LIBRETRO
 extern u32 global_enable_audio;

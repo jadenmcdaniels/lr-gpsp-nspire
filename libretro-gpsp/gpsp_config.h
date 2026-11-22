@@ -13,8 +13,18 @@
 
 /* Cache sizes and their config knobs */
 #if defined(SMALL_TRANSLATION_CACHE)
+  #ifdef NSPIRE_TEST_ROM_CACHE_KB
+  /* tests/arm ROMCACHE_KB=N: a small ROM cache, flushed often */
+  #define ROM_TRANSLATION_CACHE_SIZE (1024 * NSPIRE_TEST_ROM_CACHE_KB)
+  #else
   #define ROM_TRANSLATION_CACHE_SIZE (1024 * 1024 * 2)
+  #endif
+  #ifdef NSPIRE_TEST_RAM_CACHE_KB
+  /* tests/arm RAMCACHE_KB=N: a small RAM cache, its limits met often */
+  #define RAM_TRANSLATION_CACHE_SIZE (1024 * NSPIRE_TEST_RAM_CACHE_KB)
+  #else
   #define RAM_TRANSLATION_CACHE_SIZE (1024 * 384)
+  #endif
 #else
   #define ROM_TRANSLATION_CACHE_SIZE (1024 * 1024 * 10)
   #define RAM_TRANSLATION_CACHE_SIZE (1024 * 512)

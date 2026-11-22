@@ -1,0 +1,137 @@
+USB games
+=========
+
+The game list's folders include "USB drive" when built with nspire-usbms.
+Open it, choose a folder, then a .gba/.agb, .gbz or .zip game (with or
+without .tns). FAT16, FAT32 and exFAT are read by the driver. Plug the drive
+in after gpSP starts, or unplug and replug it if the OS still assigned it
+to an earlier run. Games are only read; nothing is written to the drive
+unless Saves on is set to USB drive (below).
+
+A drive can be in the OTG adapter or in a USB hub beside a controller and a
+sound adapter. Pulled out and plugged back in (the same hub port or another)
+it is opened again wherever a USB game is read: on the drive's page, and
+when a USB game is picked on the paused menu's first line. The page opens
+in the folder it was left in while the same drive stays opened. A drive
+that is in and could not be opened (a card reader whose card went in
+later, a drive that was not ready) is tried again with enter. A game on
+the drive and its copy on the calculator ("Game.gba" and "Game.gba.tns")
+share one save and one set of states.
+
+USB games must fit completely in RAM: gpSP grows the ROM buffers for them
+and closes the file before play. If memory is short, loading stops with a
+message; copying the game to the calculator allows the usual ROM paging.
+Removing the drive after loading leaves the game running. Removing it
+during loading cancels that load. Saves and savestates stay in the
+calculator's zgpSP_files folder unless Saves on says USB drive (below);
+settings always do. The existing game identity rules apply.
+No copy-to-play shortcut exists, so an internal file with the same name
+and size can never replace the selected USB game's contents.
+
+Saves on the drive
+------------------
+While a drive is in that can be written, the paused menu's Save and Load
+have two places, CALCULATOR and USB DRIVE; tab switches between them. Each
+has its own slots. Save on the drive's tab saves to the drive's next free
+slot; Load there loads the picked one, whether the game itself is on the
+drive or on the calculator. On Load, c copies the picked slot to the other
+place's next free slot (never over one; a state that is there already is
+not copied twice). Settings, System, Manage saves lists the calculator's
+saves; there T copies the marked ones (A marks all), or the picked one, to
+the drive, the game's own save too (another save of the game there is
+replaced only after a question).
+
+Settings, Saving, Saves on: Calculator (as every calculator has it) or USB
+drive; the line is there while a drive is in. It is the tab Save and Load
+open on, and with USB drive gpSP also keeps the game's saves on the drive
+by itself:
+- Save when I quit saves to the drive's next slot;
+- Resume last save resumes from the newest state of both places;
+- a state saved with the save key or by autosave is saved on the calculator
+  (as always) and copied to the drive when the menu next opens or the game
+  is left;
+- the game's own save has a copy on the drive.
+
+  /gpsp/saves/Game.gba.sav       the game's own save, plain (what a PC
+                                 emulator reads; a Game.gba.sav.gz there,
+                                 the calculator's compressed one, is read too)
+  /gpsp/states/Game.gba12.svs    slot 13 of the drive's
+  /gpsp/saves/Game.gba.id        the game's 4-byte code: a different game of
+                                 the same name gets Game.gba~CODE... files
+
+The names are the calculator's without ".tns", the files the same bytes.
+
+The drive is written only where a wait does no harm (a USB write takes tens
+of milliseconds to seconds): in the paused menu (Save, c, the save manager),
+when the menu opens, when a game is left. It is read at a game's start (with
+Saves on: USB drive), when the menu opens and when tab is pressed. While the
+game runs nothing is read from it or written to it: the game's own save is
+written to the calculator as always and its copy on the drive follows at the
+next of those moments; the save and load keys work on the calculator's
+slots. So after a crash, or with the drive pulled out before the menu was
+opened, the drive has the older save and the calculator the newer one. At
+the game's next start with the drive in, gpSP knows which is which (it
+keeps, beside the calculator's save, the sum both last had in common): the
+calculator's newer save is copied to the drive and "Calculator's save was
+newer: drive updated" is said; a save changed on the drive elsewhere (a PC,
+another calculator) is taken; when both changed, it asks which to keep.
+
+No drive in, a write-protected or full one, or a write that fails, with
+Saves on: USB drive: the saves are the calculator's, as with Saves on:
+Calculator, and one line says so once ("No USB drive: saves on the
+calculator"). The drive's tab is not shown without a drive that can hold
+saves. A Save on the drive's tab that could not be written says so and
+saves nothing; the calculator's tab is one key away. Nothing on the drive is
+replaced by half a file: a file is written under another name, synced, and
+only then takes its name; what a write cut short leaves behind is put right
+the next time the drive is read. When the drive is back (the menu opened,
+or the next game), "Saves are on the USB drive again" is said and the states
+the keys saved meanwhile are copied to it.
+
+The save manager, the game list's pictures and "last played", and the
+paused menu's "last save" line are the calculator's saves'. Nothing in gpSP
+deletes a state from the drive (a PC does).
+
+Build with USBMS_DIR pointing to nspire-usbms with
+USBMS_SAFE_REMOVABLE_API, and nspire-usbshim d99f163 or later.
+USBMS=0 omits the drive library. With gamepads enabled the two drivers use
+the one shim already included in usbpad_all.o; without them gpSP builds
+its own shim object.
+
+Validation
+----------
+tests/host/drive_tests.sh uses the real BOT parser, FatFs, stdio cookie,
+GBA loader, GBZ/ZIP readers and state writer over a fake removable disk.
+It covers FAT16/FAT32, full ROM growth, memory allocation failure, cached
+unplug, raw/GBZ/ZIP loads, same-name different internal content, read-only
+modes, mid-load unplug and save/load after unplug. SHA-256 verifies the
+disk images are unchanged. SAN=1 GPSP_TEST_BUILD=build-san enables ASan,
+UBSan and alignment checks.
+
+The nspire-usbms suite also covers fragmented files, UTF-8/long names,
+300-entry directories, 4096-byte sectors, exFAT, malformed cyclic FAT
+chains, retries and stale handles. Its OS adapter test executes the same
+transfer/lifetime code natively with sanitizers and under ARM926 emulation.
+TI's status table is checked before registration; transfer buffers use
+TI descriptors and completion callbacks live in the resident shim.
+An abort or close that does not return ownership retains the private heap
+buffer and OS transfer instead of freeing memory the OS may still use.
+
+tests/host/drive_save_tests.py IMAGE (one of drive_tests.sh's images; it
+works on copies) runs gpSP's whole frontend with a writable drive: Save and
+Load on the drive's tab, on another calculator, Saves on set in the menu,
+the save key's and autosave's states copied when the menu opens, a run that
+died after the key, c both ways, the save manager's T and its question, the
+game's save at the menu and at quit and at the next start on another
+calculator, the calculator's newer save, the drive's changed elsewhere, the
+question, the drive pulled out on its tab and while the game runs and put
+back, a write-protected and a full drive, a game that is itself on the
+drive, the files a cut write leaves; fsck.vfat -n on every copy at the end.
+drive_tests.c pulls the drive out at every command of a state's and a
+save's write. nspire-usbms's own tests do the same for its file writes on
+FAT16, FAT32 and exFAT, and check what usbms_settle makes of each cut.
+
+Calculator builds pass. Physical USB-drive enumeration, loading throughput,
+writing and unplug/exit still require testing on actual calculators;
+software tests do not establish hardware success. No drive has been read
+or written on a calculator yet.

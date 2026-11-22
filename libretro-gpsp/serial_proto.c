@@ -41,13 +41,20 @@ void netpacket_send(uint16_t client_id, const void *buf, size_t len);
 
 static void pack16(u32 *buf, const u16 *data, size_t wcnt) {
   u32 i;
+  // R6: an odd count's last word has no second half (it read one past).
   for (i = 0; i < (wcnt+1)/2; i++)
-    buf[i] = netorder32((data[i*2] << 16) | (data[i*2+1]));
+    buf[i] = netorder32(((u32)data[i*2] << 16) | (i*2+1 < wcnt ? data[i*2+1] : 0));
 }
-static void unpack16(u16 *buf, const u32 *data, size_t wcnt) {
+static u32 unpack32(const u8 *data) {
+  return (u32)data[0] << 24 | (u32)data[1] << 16 | (u32)data[2] << 8 | data[3];
+}
+
+static void unpack16(u16 *buf, const u8 *data, size_t wcnt) {
   u32 i;
+  /* A packet with an odd halfword count has no trailing halfword. Byte
+   * reads also accept the unaligned buffers the transport may hand us. */
   for (i = 0; i < wcnt; i++)
-    buf[i] = (netorder32(data[i/2])) >> ((i & 1) ? 0 : 16);
+    buf[i] = (u16)data[2 * i] << 8 | data[2 * i + 1];
 }
 
 int ismemzero(const void *ptr, size_t bytes) {
@@ -81,7 +88,7 @@ static union {
       u8 pstate;                 // Parsing state (packet parsing FSM)
       u16 data[MAX_FPACK];
       u16 count;                 // Number of queued bytes (full packets
-      u8 recvd;                  // Whether we are sending any data
+      u16 recvd;                  // Word cursor; may reach 256
       u8 timeout;                // Number of frames since last heard from.
     } peer[4];                   // One of them not used really
 
@@ -120,6 +127,7 @@ static union {
 void serialproto_reset(void) {
   SRPT_DEBUG_LOG("Reset serial-proto state\n");
   memset(&serstate, 0, sizeof(serstate));
+  serialfe_reset();
 }
 
 static void serialpoke_senddata(u16 state, const u16 *packet) {
@@ -234,8 +242,29 @@ void serialpoke_master_send(void) {
   }
 }
 
+// nspire R3 (the link's log): each peer's state (4 bits each, peer 0 lowest)
+// and the master's word offset (bits 16-19).
+u32 serialpoke_states(void) {
+  u32 i, v = 0;
+  for (i = 0; i < 4; i++)
+    v |= (serstate.poke.peer[i].state & 0xF) << (4 * i);
+  return v | (serstate.poke.offset & 0xF) << 16;
+}
+
 void serialpoke_frame_update(void) {
   u32 i;
+  // A client's fake master sends one frame (1+8 words) every GBA frame, as
+  // the real master does from its VBlank: its count restarts each frame, so
+  // it makes 9 IRQs a frame (9 x 28672 cycles, plus up to a line's wait for
+  // the next event each, fit in 280896). Free running (~9.5 a frame) its
+  // frames drifted against the game's: the master's words then came in one
+  // and the client's own in the next, two entries in the game's receive
+  // queue for the one it takes a frame, and Gen 3's link rooms ignore the
+  // player's keys while that queue is longer than 4 (pokeemerald overworld.c
+  // KeyInterCB_SelfIdle): player 2 couldn't walk to the Colosseum's spot
+  // (nspire, tests/link/scenarios/pokemon.py).
+  if (netplay_client_id && serstate.poke.peer[netplay_client_id].state == STATE_CONNECTED)
+    serstate.poke.frcnt = 0;
   for (i = 0; i <= 3; i++) {
     if (i != netplay_client_id)
       if (serstate.poke.peer[i].timeout++ >= MAX_FRAME_TIMEOUT)
@@ -243,7 +272,7 @@ void serialpoke_frame_update(void) {
   }
 }
 
-bool serialpoke_update(unsigned cycles) {
+static __attribute__((noinline)) bool serialpoke_update_client(unsigned cycles) {
   u32 i;
   serstate.poke.frcnt += cycles;
 
@@ -369,12 +398,24 @@ bool serialpoke_update(unsigned cycles) {
   return false;
 }
 
+// Runs at every event. Only a netplay client pretends a master sends (out
+// of line, so the code every event runs stays small: common.h NSPIRE_HOT).
+NSPIRE_HOT bool serialpoke_update(unsigned cycles) {
+  if (!netplay_client_id) {
+    serstate.poke.frcnt += cycles;
+    return false;
+  }
+  return serialpoke_update_client(cycles);
+}
+
 void serialpoke_net_receive(const void* buf, size_t len, uint16_t client_id) {
   // MPK1 header, sanity checking.
-  const u32 *pkt = (u32*)buf;
-  if (len == 24 && netorder32(pkt[0]) == NET_SERPOKE_HEADER) {
+  const u8 *pkt = (const u8 *)buf;
+  if (client_id >= 4 || !pkt)
+    return;
+  if (len == 24 && unpack32(pkt) == NET_SERPOKE_HEADER) {
     const unsigned count = serstate.poke.peer[client_id].count;
-    const u32 flags = netorder32(pkt[1]);
+    const u32 flags = unpack32(pkt + 4);
 
     serstate.poke.peer[client_id].timeout = 0;
 
@@ -383,7 +424,7 @@ void serialpoke_net_receive(const void* buf, size_t len, uint16_t client_id) {
                    client_id, serstate.poke.peer[client_id].state);
 
     if ((flags & 0x80000000) && count < MAX_QPACK) {
-      unpack16(serstate.poke.peer[client_id].data[count], &pkt[2], 8);
+      unpack16(serstate.poke.peer[client_id].data[count], pkt + 8, 8);
       serstate.poke.peer[client_id].count++;
     }
     else if ((flags & 0x80000000)) {
@@ -416,7 +457,11 @@ void serialpoke_net_receive(const void* buf, size_t len, uint16_t client_id) {
 #define PACK_TAIL_SZ   (serial_mode == SERIAL_MODE_SERIAL_AW1 ? 1 : 2)
 
 static void serialaw_senddata(u16 cmd, u8 state, const u16 *packet, size_t wcnt) {
-  u32 flags = (cmd << 16) | (state << 8) | wcnt;
+  /* The wire count is one byte; malformed guest sequences must never
+   * overrun pkt or turn high count bits into the remote state field. */
+  if (wcnt > 255)
+    return;
+  u32 flags = ((u32)cmd << 16) | (state << 8) | wcnt;
   u32 pkt[2 + 128] = {
     netorder32(NET_SERADWR_HEADER),  // Header magic
     netorder32(flags),               // Current device state
@@ -509,8 +554,10 @@ void serialaw_master_send(void) {
     if (mvalue >= 0x8000 && mvalue <= 0x9F00) {
       for (i = 1; i <= 3; i++)
         write_ioreg(REG_SIOMULTI0 + i, process_awpeer_val(i) ?: (mvalue & 0xFC00));
-      if (mvalue & 0x3FF)
-        serstate.aw.peer[0].data[serstate.aw.peer[0].count++] = mvalue;
+      if (mvalue & 0x3FF) {
+        if (serstate.aw.peer[0].count < 256)
+          serstate.aw.peer[0].data[serstate.aw.peer[0].count++] = mvalue;
+      }
       else {
         serialaw_senddata(serstate.aw.lastcmd, STATE_INTERSYNC, serstate.aw.peer[0].data, serstate.aw.peer[0].count);
         serstate.aw.peer[0].count = 0;
@@ -567,7 +614,7 @@ void serialaw_master_send(void) {
     read_ioreg(REG_SIOMULTI2), read_ioreg(REG_SIOMULTI3));
 }
 
-bool serialaw_update(unsigned cycles) {
+static __attribute__((noinline)) bool serialaw_update_client(unsigned cycles) {
   u32 i;
   serstate.aw.frcnt += cycles;
 
@@ -608,8 +655,10 @@ bool serialaw_update(unsigned cycles) {
         for (i = 0; i <= 3; i++)
           if (i != netplay_client_id)
             write_ioreg(REG_SIOMULTI0 + i, process_awpeer_val(i) ?: (mdata & 0xFC00));
-        if (mdata & 0x3FF)
-          serstate.aw.peer[netplay_client_id].data[serstate.aw.peer[netplay_client_id].count++] = mdata;
+        if (mdata & 0x3FF) {
+          if (serstate.aw.peer[netplay_client_id].count < 256)
+            serstate.aw.peer[netplay_client_id].data[serstate.aw.peer[netplay_client_id].count++] = mdata;
+        }
         else {
           serialaw_senddata(serstate.aw.lastcmd, STATE_INTERSYNC,
                             serstate.aw.peer[netplay_client_id].data, serstate.aw.peer[netplay_client_id].count);
@@ -676,15 +725,29 @@ bool serialaw_update(unsigned cycles) {
   return false;
 }
 
+// Runs at every event. Only a netplay client pretends a master sends (out
+// of line, so the code every event runs stays small: common.h NSPIRE_HOT).
+NSPIRE_HOT bool serialaw_update(unsigned cycles) {
+  if (!netplay_client_id) {
+    serstate.aw.frcnt += cycles;
+    return false;
+  }
+  return serialaw_update_client(cycles);
+}
+
 void serialaw_net_receive(const void* buf, size_t len, uint16_t client_id) {
   // MAW1 header, sanity checking.
-  const u32 *pkt = (u32*)buf;
-  if (len >= 8 && netorder32(pkt[0]) == NET_SERADWR_HEADER) {
-    const u32 flags = netorder32(pkt[1]);
+  const u8 *pkt = (const u8 *)buf;
+  if (client_id >= 4 || !pkt)
+    return;
+  if (len >= 8 && unpack32(pkt) == NET_SERADWR_HEADER) {
+    const u32 flags = unpack32(pkt + 4);
     const u16 cmd = flags >> 16;
     const u16 ste = (flags >> 8) & 0xff;    // Peer state.
     const u16 cnt = flags & 0x00ff;         // Number of words to follow.
 
+    if (ste > STATE_INTERSYNC || len != 8 + cnt * 2)
+      return;
     serstate.aw.peer[client_id].timeout = 0;
     serstate.aw.peer[client_id].state = ste;
 
@@ -694,7 +757,7 @@ void serialaw_net_receive(const void* buf, size_t len, uint16_t client_id) {
       if (cnt >= 2 && len == cnt * 2 + 8) {
         if (serstate.aw.peer[client_id].count + cnt + 1 < MAX_FPACK) {
           serstate.aw.peer[client_id].data[serstate.aw.peer[client_id].count++] = cnt;
-          unpack16(&serstate.aw.peer[client_id].data[serstate.aw.peer[client_id].count], &pkt[2], cnt);
+          unpack16(&serstate.aw.peer[client_id].data[serstate.aw.peer[client_id].count], pkt + 8, cnt);
           serstate.aw.peer[client_id].count += cnt;
 
           SRPT_DEBUG_LOG("Received valid sync command client %d: %04x\n", client_id, cmd);
@@ -708,7 +771,7 @@ void serialaw_net_receive(const void* buf, size_t len, uint16_t client_id) {
           // Also the command value (should be 0x4FFF) is inserted too.
           serstate.aw.peer[client_id].data[serstate.aw.peer[client_id].count++] = cnt + 1;  // Packet + command
           serstate.aw.peer[client_id].data[serstate.aw.peer[client_id].count++] = cmd;
-          unpack16(&serstate.aw.peer[client_id].data[serstate.aw.peer[client_id].count], &pkt[2], cnt);
+          unpack16(&serstate.aw.peer[client_id].data[serstate.aw.peer[client_id].count], pkt + 8, cnt);
           serstate.aw.peer[client_id].count += cnt;
 
           SRPT_DEBUG_LOG("Received valid packet from client %d (with %d words)\n",

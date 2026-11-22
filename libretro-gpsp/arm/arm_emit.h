@@ -66,6 +66,7 @@ void execute_swi_thumb(u32 pc);
 #define armfn_indirect_dual_arm   12
 #define armfn_indirect_dual_thumb 13
 #define armfn_debug_trace         14
+#define armfn_gbaup_idle_pass_thumb 15   /* speed9b, Nspire */
 
 #define STORE_TBL_OFF     0x118
 #define SPSR_RAM_OFF      0x100
@@ -74,8 +75,20 @@ void execute_swi_thumb(u32 pc);
   *((u32 *)translation_ptr) = value;                                          \
   translation_ptr += 4                                                        \
   
+#ifdef NSPIRE_BUILD
+/* speed10b: every branch offset the translation encodes, its place logged
+ * (nspire_rel_offset, below nspire_block_tail_state): a RAM block's copy
+ * (cpu_threaded.c "RAM blocks kept across Partial SMC's flushes") moves
+ * those of its branches that leave the block. */
+static u32 nspire_rel_offset(u32 source, u32 target);
+#define arm_relative_offset(source, offset)                                   \
+  nspire_rel_offset((u32)(source), (u32)(offset))                            \
+
+#else
 #define arm_relative_offset(source, offset)                                   \
   (((((u32)offset - (u32)source) - 8) >> 2) & 0xFFFFFF)                       \
+
+#endif
 
 
 #define reg_a0          ARMREG_R0
@@ -437,11 +450,295 @@ u32 arm_disect_imm_32bit(u32 imm, u32 *stores, u32 *rotations)
  * the CPU into halt mode too, however.
  */
 
+#ifdef NSPIRE_BUILD
+/* speed9b (2026-11-18): an idle loop whose pass main.c checks (Advance
+ * Wars', nspire_idle_pass_code: its code as expected) calls
+ * arm_update_gba_idle_pass_thumb (arm_stub.S; function table entry
+ * armfn_gbaup_idle_pass_thumb, the same two words as the idle stub's call),
+ * any other the idle stub as before. */
+u32 arm_update_gba_idle_pass_thumb(u32 pc);
+bool nspire_idle_pass_code(u32 new_pc);
+
+static u8 *nspire_idle_call(u8 *translation_ptr, u32 new_pc, u32 thumb);
+#define nspire_idle_mode_arm    0
+#define nspire_idle_mode_thumb  1
+
+#define generate_branch_idle_eliminate(writeback_location, new_pc, mode)      \
+  translation_ptr = nspire_idle_call(translation_ptr, new_pc,                 \
+   nspire_idle_mode_##mode);                                                  \
+  write32(new_pc);                                                            \
+  generate_branch_filler(ARMCOND_AL, writeback_location)                      \
+
+#else
 #define generate_branch_idle_eliminate(writeback_location, new_pc, mode)      \
   generate_function_far_call(armfn_gbaup_idle_##mode);                        \
   write32(new_pc);                                                            \
   generate_branch_filler(ARMCOND_AL, writeback_location)                      \
 
+#endif
+
+#ifdef NSPIRE_BUILD
+/* core-16 (2026-11-15): an idle loop whose body is proven pure at
+ * translation calls arm_update_gba_pure_thumb (arm_stub.S) instead: its
+ * update_gba runs the next events too (without the body) while nothing the
+ * body reads can have changed (main.c).
+ *
+ * Pure: a Thumb loop in ROM jumping back within its block (new_pc <= pc),
+ * at most NSPIRE_IDLE_PURE_MAX instructions before the branch, each a load
+ * or register arithmetic on r0-r7 (no store, push/pop, ldm/stm, branch,
+ * swi, high-register or SP write), and no register or flag read before the
+ * body writes it is written anywhere in the body: the body then ends in
+ * the same registers and flags at every pass while memory is unchanged.
+ * The loads' addresses are the same at every pass; whether they read
+ * plain memory is checked as it runs: their calls are pointed at
+ * mem_dispatch_load_*_pure (arm_stub.S, REG_IDLE_TAINT). */
+u32 arm_update_gba_pure_thumb(u32 pc);
+void mem_dispatch_load_u8(void);
+void mem_dispatch_load_s8(void);
+void mem_dispatch_load_u16(void);
+void mem_dispatch_load_s16(void);
+void mem_dispatch_load_u32(void);
+void mem_dispatch_load_u8_pure(void);
+void mem_dispatch_load_s8_pure(void);
+void mem_dispatch_load_u16_pure(void);
+void mem_dispatch_load_s16_pure(void);
+void mem_dispatch_load_u32_pure(void);
+
+#define NSPIRE_IDLE_PURE_MAX 16
+/* pure idle branches translated (tests/arm idle_test) */
+u32 nspire_idle_pure_count;
+/* the scan's bits: r0-r7 (0-7), SP (13), N Z C V (16-19) */
+#define IDLE_R(r)  (1u << (r))
+#define IDLE_SP    (1u << 13)
+#define IDLE_N     (1u << 16)
+#define IDLE_Z     (1u << 17)
+#define IDLE_C     (1u << 18)
+#define IDLE_V     (1u << 19)
+#define IDLE_NZ    (IDLE_N | IDLE_Z)
+#define IDLE_NZCV  (IDLE_N | IDLE_Z | IDLE_C | IDLE_V)
+
+/* What a Thumb opcode reads, surely writes and may write (C of a shift by
+ * a register), and whether it is a load (1; 2: a pc-relative one, which
+ * translate_thumb_instruction may turn into a constant); false: not
+ * allowed in a pure body. */
+static bool nspire_idle_op(u32 op, u32 *rd_set, u32 *wr_set, u32 *may_set,
+ u32 *load)
+{
+  u32 rd3 = IDLE_R(op & 7), rs3 = IDLE_R((op >> 3) & 7);
+  u32 rn3 = IDLE_R((op >> 6) & 7), rd8 = IDLE_R((op >> 8) & 7);
+  u32 r = 0, w = 0, m = 0;
+
+  *load = 0;
+
+  switch(op >> 11)
+  {
+    case 0x00:                                     /* LSL rd, rs, #imm */
+      r = rs3; w = rd3 | IDLE_NZ | (((op >> 6) & 31) ? IDLE_C : 0);
+      break;
+    case 0x01: case 0x02:                          /* LSR, ASR #imm */
+      r = rs3; w = rd3 | IDLE_NZ | IDLE_C;
+      break;
+    case 0x03:                                     /* ADD/SUB rd, rs, rn/#imm */
+      r = rs3 | ((op & 0x400) ? 0 : rn3); w = rd3 | IDLE_NZCV;
+      break;
+    case 0x04:                                     /* MOV rd, #imm */
+      w = rd8 | IDLE_NZ;
+      break;
+    case 0x05:                                     /* CMP rd, #imm */
+      r = rd8; w = IDLE_NZCV;
+      break;
+    case 0x06: case 0x07:                          /* ADD/SUB rd, #imm */
+      r = rd8; w = rd8 | IDLE_NZCV;
+      break;
+    case 0x08:
+      if(op & 0x400)                               /* high registers, BX */
+        return false;
+      r = rd3 | rs3;
+      switch((op >> 6) & 15)
+      {
+        case 0: case 1: case 12: case 14:          /* AND EOR ORR BIC */
+          w = rd3 | IDLE_NZ; break;
+        case 2: case 3: case 4: case 7:            /* LSL LSR ASR ROR rs */
+          w = rd3 | IDLE_NZ; m = IDLE_C; break;
+        case 5: case 6:                            /* ADC SBC */
+          r |= IDLE_C; w = rd3 | IDLE_NZCV; break;
+        case 8:                                    /* TST */
+          w = IDLE_NZ; break;
+        case 9:                                    /* NEG */
+          r = rs3; w = rd3 | IDLE_NZCV; break;
+        case 10: case 11:                          /* CMP CMN */
+          w = IDLE_NZCV; break;
+        case 13:                                   /* MUL */
+          w = rd3 | IDLE_NZ; m = IDLE_C; break;
+        default:                                   /* MVN */
+          r = rs3; w = rd3 | IDLE_NZ; break;
+      }
+      break;
+    case 0x09:                                     /* LDR rd, [pc, #imm] */
+      w = rd8; *load = 2;
+      break;
+    case 0x0A: case 0x0B:                          /* [rb, ro]: loads only */
+      if(((op >> 9) & 7) < 3)
+        return false;
+      r = rs3 | rn3; w = rd3; *load = 1;
+      break;
+    case 0x0D: case 0x0F: case 0x11:               /* LDR, LDRB, LDRH #imm */
+      r = rs3; w = rd3; *load = 1;
+      break;
+    case 0x13:                                     /* LDR rd, [sp, #imm] */
+      r = IDLE_SP; w = rd8; *load = 1;
+      break;
+    case 0x14:                                     /* ADD rd, pc, #imm */
+      w = rd8;
+      break;
+    case 0x15:                                     /* ADD rd, sp, #imm */
+      r = IDLE_SP; w = rd8;
+      break;
+    default:
+      return false;
+  }
+  *rd_set = r;
+  *wr_set = w;
+  *may_set = w | m;
+  return true;
+}
+
+/* The flags a condition (ARM numbering, 14 always) reads. */
+static u32 nspire_idle_cond_flags(u32 cond)
+{
+  static const u32 flags[8] = { IDLE_Z, IDLE_C, IDLE_N, IDLE_V,
+   IDLE_C | IDLE_Z, IDLE_N | IDLE_V, IDLE_N | IDLE_Z | IDLE_V, 0 };
+  return flags[(cond >> 1) & 7];
+}
+
+/* The body's translated code, [code, code_end): every load call ("bl
+ * mem_dispatch_load_*" whose PC word is a body instruction's: since
+ * core-17 the ROM cache's table of them, nspire_pcs, newest first) is
+ * counted and, if patch, pointed at its _pure entry. */
+typedef struct
+{
+  u32 host;
+  u32 pc;
+} nspire_mem_pc_type;
+static const nspire_mem_pc_type *nspire_rom_pcs_newest(u32 *count);
+
+static u32 nspire_idle_patch_loads(u8 *code, u8 *code_end, u32 new_pc,
+ u32 pc, bool patch)
+{
+  static void (*const plain[5])(void) = { mem_dispatch_load_u8,
+   mem_dispatch_load_s8, mem_dispatch_load_u16, mem_dispatch_load_s16,
+   mem_dispatch_load_u32 };
+  static void (*const pure[5])(void) = { mem_dispatch_load_u8_pure,
+   mem_dispatch_load_s8_pure, mem_dispatch_load_u16_pure,
+   mem_dispatch_load_s16_pure, mem_dispatch_load_u32_pure };
+  u32 calls = 0, k, n;
+  const nspire_mem_pc_type *e = nspire_rom_pcs_newest(&n);
+
+  for(; n && e->host > (u32)code; e++, n--)
+  {
+    u32 target;
+    u32 *word = (u32 *)(e->host - 4);     /* the call                      */
+    if(e->host > (u32)code_end || e->pc < new_pc || e->pc >= pc ||
+     (word[0] & 0xFF000000) != 0xEB000000)
+      continue;
+    target = (u32)word + 8 + (((s32)(word[0] << 8)) >> 6);
+    for(k = 0; k < 5; k++)
+    {
+      if(target == (u32)plain[k])
+      {
+        calls++;
+        if(patch)
+          word[0] = 0xEB000000 |
+           ((((u32)pure[k] - ((u32)word + 8)) >> 2) & 0xFFFFFF);
+      }
+    }
+  }
+  return calls;
+}
+
+/* The branch at pc (to new_pc, under cond) closes a pure idle loop. page:
+ * pc's 32 KB page as translation reads it; code, code_end: the body's
+ * translated code (block_data's offsets of new_pc and pc). If so, the
+ * body's loads are pointed at the _pure dispatch. */
+static bool nspire_idle_body_pure(const u8 *page, u32 block_start, u32 new_pc,
+ u32 pc, u32 cond, u8 *code, u8 *code_end)
+{
+  u32 rd[NSPIRE_IDLE_PURE_MAX], wr[NSPIRE_IDLE_PURE_MAX], may, load;
+  u32 n, i, written = 0, defined = 0, loads = 0;
+
+  if(pc < 0x08000000 || pc >= 0x0E000000 || new_pc < block_start ||
+   new_pc > pc || (new_pc & 1) || (new_pc >> 15) != (pc >> 15) ||
+   (cheat_master_hook >= new_pc && cheat_master_hook <= pc))
+    return false;
+  n = (pc - new_pc) / 2;
+  if(n > NSPIRE_IDLE_PURE_MAX)
+    return false;
+  for(i = 0; i < n; i++)
+  {
+    u32 at = new_pc + i * 2, op = address16(page, at & 0x7FFF);
+    if(!nspire_idle_op(op, &rd[i], &wr[i], &may, &load))
+      return false;
+    written |= may;
+    /* translate_thumb_instruction's constant: ROM, the word's page */
+    if(load == 2)
+      load = ((((at & ~2) + (op & 0xFF) * 4 + 4 + 4) >> 15) != (at >> 15));
+    loads += load;
+  }
+  /* A value read before the body surely wrote it is the one from before
+   * the body: it must be one the body never writes. */
+  for(i = 0; i < n; i++)
+  {
+    if(rd[i] & ~defined & written)
+      return false;
+    defined |= wr[i];
+  }
+  if(nspire_idle_cond_flags(cond) & ~defined & written)
+    return false;
+  /* Every load through a dispatch call that can be checked as it runs. */
+  if(nspire_idle_patch_loads(code, code_end, new_pc, pc, false) != loads)
+    return false;
+  nspire_idle_patch_loads(code, code_end, new_pc, pc, true);
+  nspire_idle_pure_count++;
+  return true;
+}
+
+/* Taken only for Thumb branches (thumb_conditional_branch, thumb_b), once
+ * each: it patches the body's loads when it says yes. */
+#define nspire_idle_pure(new_pc, cond)                                        \
+  (!ram_region &&                                                             \
+   (pc == idle_loop_target_pc || (new_pc) == idle_loop_target_pc) &&          \
+   (new_pc) >= block_start_pc && (new_pc) <= pc &&                            \
+   nspire_idle_body_pure(pc_address_block, block_start_pc, (new_pc), pc,      \
+    (cond), block_data[((new_pc) - block_start_pc) / 2].block_offset,         \
+    block_data[block_data_position].block_offset))                            \
+
+#define generate_branch_idle_pure(writeback_location, new_pc)                 \
+  ARM_BL(0, arm_relative_offset(translation_ptr,                              \
+   (u32)arm_update_gba_pure_thumb));                                          \
+  write32(new_pc);                                                            \
+  generate_branch_filler(ARMCOND_AL, writeback_location)                      \
+
+/* The loop's exit (a conditional branch's fall-through): not armed. */
+#define generate_idle_disarm()                                                \
+  ARM_MOV_REG_IMM(0, reg_a0, 0, 0);                                           \
+  ARM_STR_IMM(0, reg_a0, reg_base, (REG_IDLE_ARMED * 4))                      \
+
+#endif
+
+#ifdef NSPIRE_BUILD
+/* The cycle check at a block's exit, in 3 words instead of 6 (a fifth of
+ * the translated code; the ARM926's instruction cache is 16 KB): a shared
+ * stub (arm_stub.S, arm_check_update_*) returns past the PC word while
+ * cycles are left, else updates the GBA from there. */
+void arm_check_update_arm(void);
+void arm_check_update_thumb(void);
+
+#define generate_branch_update(writeback_location, new_pc, mode)              \
+  ARM_BL(0, arm_relative_offset(translation_ptr, (u32)arm_check_update_##mode)); \
+  write32(new_pc);                                                            \
+  generate_branch_filler(ARMCOND_AL, writeback_location)                      \
+
+#else
 #define generate_branch_update(writeback_location, new_pc, mode)              \
   ARM_MOV_REG_IMMSHIFT(0, reg_a0, reg_cycles, ARMSHIFT_LSR, 31);              \
   /* If counter is negative, skip the update call (2 insts) */                \
@@ -450,9 +747,11 @@ u32 arm_disect_imm_32bit(u32 imm, u32 *stores, u32 *rotations)
   generate_function_far_call(armfn_gbaup_##mode);   /* 2 instructions */      \
   generate_branch_filler(ARMCOND_AL, writeback_location)                      \
 
+#endif
+
 
 #define generate_branch_no_cycle_update(writeback_location, new_pc, mode)     \
-  if(pc == idle_loop_target_pc)                                               \
+  if(pc == idle_loop_target_pc || (new_pc) == idle_loop_target_pc)            \
   {                                                                           \
     generate_branch_idle_eliminate(writeback_location, new_pc, mode);         \
   }                                                                           \
@@ -520,6 +819,21 @@ u32 arm_disect_imm_32bit(u32 imm, u32 *stores, u32 *rotations)
 
 #define generate_load_memreg(ireg, reg_index)                                 \
   ARM_LDR_IMM(0, ireg, reg_base, ((reg_index) * 4));                          \
+
+#ifdef NSPIRE_BUILD
+/* speed9b: the idle branch's call (one copy, out of line: the macro
+   generate_branch_idle_eliminate is in every branch's expansion). */
+static __attribute__((noinline)) u8 *nspire_idle_call(u8 *translation_ptr,
+ u32 new_pc, u32 thumb)
+{
+  /* the same two words either way: the blocks after it where they were */
+  u32 fn = thumb && nspire_idle_pass_code(new_pc) ?
+   armfn_gbaup_idle_pass_thumb : thumb ? armfn_gbaup_idle_thumb :
+   armfn_gbaup_idle_arm;
+  generate_function_far_call(fn);
+  return translation_ptr;
+}
+#endif
 
 #define arm_generate_load_reg(ireg, reg_index)                                \
 {                                                                             \
@@ -706,7 +1020,7 @@ u32 thumb_prepare_load_reg_pc(u8 **tptr, u32 scratch_reg, u32 reg_index, u32 pc_
   }                                                                           \
 
 
-u32 execute_spsr_restore_body(u32 pc)
+NSPIRE_HOT u32 execute_spsr_restore_body(u32 pc)
 {
   set_cpu_mode(cpu_modes[reg[REG_CPSR] & 0xF]);
   check_for_interrupts();
@@ -1223,7 +1537,7 @@ u32 execute_spsr_restore_body(u32 pc)
  * wrap it correctly.
  */
 
-u32 execute_store_cpsr_body(u32 _cpsr, u32 store_mask, u32 address)
+NSPIRE_HOT u32 execute_store_cpsr_body(u32 _cpsr, u32 store_mask, u32 address)
 {
   reg[REG_CPSR] = _cpsr;
   if(store_mask & 0xFF)
@@ -1243,6 +1557,25 @@ u32 execute_store_cpsr_body(u32 _cpsr, u32 store_mask, u32 address)
   return 0;
 }
 
+#ifdef NSPIRE_GBA_PROFILE
+/* Model-only (tests/arm GBA_PROFILE=1): every GBA instruction the translated
+ * code runs calls this (TRACE_INSTRUCTIONS' hook), counted by its PC (Thumb
+ * ones with bit 0 set) while nspire_gba_prof_on; perf.c prints the table. */
+#define TRACE_INSTRUCTIONS
+u32 nspire_gba_prof_on;
+u32 nspire_gba_prof[1 << 17][2];
+static void trace_instruction(u32 pc, u32 mode)
+{
+  u32 key = pc | (mode ? 0 : 1), h;
+  if (!nspire_gba_prof_on)
+    return;
+  h = (key * 2654435761u) >> 15;
+  while (nspire_gba_prof[h][0] && nspire_gba_prof[h][0] != key)
+    h = (h + 1) & ((1 << 17) - 1);
+  nspire_gba_prof[h][0] = key;
+  nspire_gba_prof[h][1]++;
+}
+#else
 static void trace_instruction(u32 pc, u32 mode)
 {
   if (mode)
@@ -1253,6 +1586,7 @@ static void trace_instruction(u32 pc, u32 mode)
   print_regs();
   #endif
 }
+#endif
 
 #ifdef TRACE_INSTRUCTIONS
   #define emit_trace_instruction(pc, mode, regt)   \
@@ -1340,6 +1674,279 @@ static void trace_instruction(u32 pc, u32 mode)
     ARM_ORR_REG_IMMSHIFT(0, reg_a2, reg_a2, ARMREG_LR, ARMSHIFT_ASR, 31);
 #endif
 
+#ifdef NSPIRE_BUILD
+/* The TI-Nspire's ARM926 has a 16 KB instruction cache: the region lookup
+ * is one shared stub per access type (arm_stub.S, mem_dispatch), called
+ * with "bl"; the translated code is a quarter smaller. The translation
+ * caches are in the program image, near the stubs (bl reaches 32 MB). */
+void mem_dispatch_store_u8(void);
+void mem_dispatch_store_u16(void);
+void mem_dispatch_store_u32(void);
+void mem_dispatch_store_u32_safe(void);
+void mem_dispatch_load_u8(void);
+void mem_dispatch_load_s8(void);
+void mem_dispatch_load_u16(void);
+void mem_dispatch_load_s16(void);
+void mem_dispatch_load_u32(void);
+
+#define generate_mem_dispatch(name)                                           \
+  ARM_BL(0, arm_relative_offset(translation_ptr, (u32)(name)));               \
+
+#define generate_store_call_u8()        generate_mem_dispatch(mem_dispatch_store_u8)
+#define generate_store_call_u16()       generate_mem_dispatch(mem_dispatch_store_u16)
+#define generate_store_call_u32()       generate_mem_dispatch(mem_dispatch_store_u32)
+#define generate_store_call_u32_safe()  generate_mem_dispatch(mem_dispatch_store_u32_safe)
+#define generate_load_call_u8()         generate_mem_dispatch(mem_dispatch_load_u8)
+#define generate_load_call_s8()         generate_mem_dispatch(mem_dispatch_load_s8)
+#define generate_load_call_u16()        generate_mem_dispatch(mem_dispatch_load_u16)
+#define generate_load_call_s16()        generate_mem_dispatch(mem_dispatch_load_s16)
+#define generate_load_call_u32()        generate_mem_dispatch(mem_dispatch_load_u32)
+
+/* core-17 (2026-11-15): no PC word after a memory access's "bl
+ * mem_dispatch_*" (every access fetched it with its cache line, never ran
+ * it); the handlers return with "bx lr". The few paths that need the GBA PC
+ * (the SMC flush, BIOS and open-bus loads, an I/O store's alert: arm_stub.S
+ * mem_pc_r2, unread_pc) ask nspire_mem_pc for the word the call used to
+ * have, by the call's return address. Each cache has a table of (return
+ * address, word), appended as the code is, so in rising address: the ROM
+ * cache's grows down from the cache's top (translate_block_* keep the code
+ * below it: mem_pc_full), the RAM cache's is nspire_pcs.ram. A flush empties
+ * its cache's table (the ROM one keeps the entries of the code below the
+ * watermark: the BIOS's SWI entry) and the lookups' small cache, but only
+ * when the next translation starts (mem_pc_settle): the flushed code can
+ * still be running then (a store's DMA flushes from inside its handler,
+ * which returns into it) and is intact until something is translated over
+ * it, which then runs instead. Tail code (core-11) appends too: one entry
+ * needs at least its 4-byte bl.
+ * NSPIRE_PCWORD_CHECK (tests/arm PCWORD_CHECK=1): the words are emitted as
+ * before, the handlers return past them, and every lookup is checked
+ * against the word. nspire_mem_pc_type (with nspire_idle_patch_loads):
+ * host, the call's return address; pc, the word it used to have. */
+#define NSPIRE_RAM_PCS  8192
+#define NSPIRE_PC_CACHE 64
+/* the entries the RAM table may hold (tests/arm RAMPCS=1, perf rampcs=N:
+   fewer, so that its limit's flushes come often) */
+#ifdef NSPIRE_TEST_RAM_PCS
+extern u32 nspire_test_ram_pcs;
+#define NSPIRE_RAM_PCS_LIMIT nspire_test_ram_pcs
+#else
+#define NSPIRE_RAM_PCS_LIMIT NSPIRE_RAM_PCS
+#endif
+
+/* 17 x 4 KB in all, so that the .bss after it keeps its place in a 4 KB
+ * way (see nspire_block_tail_state). */
+struct
+{
+  u32 ram_count;
+  u32 rom_count;
+  u32 rom_kept;                           /* below the watermark           */
+  u32 misses;                             /* lookups not found (never)     */
+  u32 pending;                            /* flushed: 1 RAM, 2 ROM         */
+  u32 ram_flushes;                        /* since the program started     */
+  u32 rom_flushes;
+  u32 unused[1];
+  nspire_mem_pc_type cache[NSPIRE_PC_CACHE];
+  nspire_mem_pc_type ram[NSPIRE_RAM_PCS];
+  u8 pad[4096 - 32 - NSPIRE_PC_CACHE * sizeof(nspire_mem_pc_type)];
+} nspire_pcs;
+
+#ifdef NSPIRE_PCWORD_CHECK
+u32 nspire_pcword_check_ok, nspire_pcword_check_bad, nspire_pcword_check_hit;
+#endif
+#ifdef NSPIRE_TEST_RAM_PCS
+u32 nspire_test_ram_pcs = NSPIRE_RAM_PCS;
+#endif
+
+/* tests/arm and gpsp_perf.txt.tns's "dynarec:" line: entries RAM (0), ROM
+ * (1), kept (2), lookups not found (3: never, or a PC table is wrong), RAM
+ * cache flushes (4), ROM cache flushes (5), the ROM cache's bytes in use,
+ * code and table (6), RAM blocks copied from the kept ones (7), the kept
+ * blocks' store emptied (8). */
+u32 nspire_mem_pc_stats(u32 which)
+{
+  switch(which)
+  {
+    case 0: return nspire_pcs.ram_count;
+    case 1: return nspire_pcs.rom_count;
+    case 2: return nspire_pcs.rom_kept;
+    case 3: return nspire_pcs.misses;
+    case 4: return nspire_pcs.ram_flushes;
+    case 5: return nspire_pcs.rom_flushes;
+    /* speed10b: RAM blocks copied from the kept blocks' store, and how
+       often the store was emptied (cpu_threaded.c) */
+    case 7: return reg[REG_RAM_KEEP_USES];
+    case 8: return reg[REG_RAM_KEEP_CLEARS];
+    default:
+      return (u32)(rom_translation_ptr - rom_translation_cache) +
+       nspire_pcs.rom_count * sizeof(nspire_mem_pc_type);
+  }
+}
+
+/* The ROM table: entry i at nspire_rom_pcs_top - 1 - i. */
+#define nspire_rom_pcs_top                                                    \
+  ((nspire_mem_pc_type *)(rom_translation_cache + ROM_TRANSLATION_CACHE_SIZE))
+
+static void nspire_mem_pc_add(u8 *host, u32 pc)
+{
+  nspire_mem_pc_type *e;
+  if((u32)host - (u32)rom_translation_cache < ROM_TRANSLATION_CACHE_SIZE)
+    e = nspire_rom_pcs_top - 1 - nspire_pcs.rom_count++;
+  else
+    e = &nspire_pcs.ram[nspire_pcs.ram_count++];
+  e->host = (u32)host;
+  e->pc = pc;
+}
+
+/* The ROM table from its newest entry (falling hosts), count entries. */
+static const nspire_mem_pc_type *nspire_rom_pcs_newest(u32 *count)
+{
+  *count = nspire_pcs.rom_count;
+  return nspire_rom_pcs_top - nspire_pcs.rom_count;
+}
+
+/* The GBA PC word of the access whose call returns to host (arm_stub.S). */
+u32 nspire_mem_pc(u32 host)
+{
+  /* The small cache's slot by the offset from where the cache's blocks
+   * start (the watermark, NSPIRE_RAM_CACHE_START): the same at every
+   * placement of the speed model's (jit=, ramjit=), so are the
+   * instructions run. */
+  u32 rom_off = host - (u32)rom_translation_cache;
+  u32 base = rom_off >= ROM_TRANSLATION_CACHE_SIZE ?
+   (u32)ram_translation_cache + NSPIRE_RAM_CACHE_START :
+   rom_off >= rom_cache_watermark ?
+   (u32)rom_translation_cache + rom_cache_watermark :
+   (u32)rom_translation_cache;
+  nspire_mem_pc_type *slot =
+   &nspire_pcs.cache[((host - base) >> 2) & (NSPIRE_PC_CACHE - 1)];
+  u32 pc;
+
+  if(slot->host == host)
+  {
+    pc = slot->pc;
+#ifdef NSPIRE_PCWORD_CHECK
+    nspire_pcword_check_hit++;
+#endif
+  }
+  else
+  {
+    const nspire_mem_pc_type *e;
+    u32 lo = 0, hi, mid;
+    s32 dir;
+    if(rom_off < ROM_TRANSLATION_CACHE_SIZE)
+    {
+      /* descending from e[0], the newest */
+      hi = nspire_pcs.rom_count;
+      e = nspire_rom_pcs_top - hi;
+      dir = -1;
+    }
+    else
+    {
+      hi = nspire_pcs.ram_count;
+      e = nspire_pcs.ram;
+      dir = 1;
+    }
+    /* the first index whose host is not below (ascending) or above
+       (descending) the one looked for */
+    while(lo < hi)
+    {
+      mid = (lo + hi) >> 1;
+      if((dir > 0) ? (e[mid].host < host) : (e[mid].host > host))
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+    if(lo < ((dir > 0) ? nspire_pcs.ram_count : nspire_pcs.rom_count) &&
+     e[lo].host == host)
+    {
+      pc = e[lo].pc;
+      slot->host = host;
+      slot->pc = pc;
+    }
+    else
+    {
+      nspire_pcs.misses++;
+      pc = reg[REG_PC];
+    }
+  }
+#ifdef NSPIRE_PCWORD_CHECK
+  if(pc == *(u32 *)host)
+    nspire_pcword_check_ok++;
+  else
+    nspire_pcword_check_bad++;
+#endif
+  return pc;
+}
+
+#define mem_pc_cache_clear()                                                  \
+  memset(nspire_pcs.cache, 0, sizeof(nspire_pcs.cache))
+
+#define mem_pc_init()                                                         \
+  nspire_pcs.ram_count = 0;                                                   \
+  nspire_pcs.rom_count = 0;                                                   \
+  nspire_pcs.rom_kept = 0;                                                    \
+  nspire_pcs.pending = 0;                                                     \
+  mem_pc_cache_clear()
+
+#define mem_pc_flush_ram()                                                    \
+  nspire_pcs.pending |= 1;                                                    \
+  nspire_pcs.ram_flushes++
+
+#define mem_pc_flush_rom()                                                    \
+  nspire_pcs.pending |= 2;                                                    \
+  nspire_pcs.rom_flushes++
+
+/* At the start of translate_block_*: the flushes' resets. */
+#define mem_pc_settle()                                                       \
+  if(nspire_pcs.pending)                                                      \
+  {                                                                           \
+    if(nspire_pcs.pending & 1)                                                \
+      nspire_pcs.ram_count = 0;                                               \
+    if(nspire_pcs.pending & 2)                                                \
+      nspire_pcs.rom_count = nspire_pcs.rom_kept;                             \
+    nspire_pcs.pending = 0;                                                   \
+    mem_pc_cache_clear();                                                     \
+  }                                                                           \
+
+/* init_bios_hooks: its code starts at the watermark, and stays. */
+#define mem_pc_bios_start()                                                   \
+  mem_pc_settle();                                                            \
+  while(nspire_pcs.rom_count && (nspire_rom_pcs_top -                         \
+   nspire_pcs.rom_count)->host >=                                             \
+   (u32)&rom_translation_cache[rom_cache_watermark])                          \
+    nspire_pcs.rom_count--;                                                   \
+  mem_pc_cache_clear()
+
+#define mem_pc_bios_end()                                                     \
+  nspire_pcs.rom_kept = nspire_pcs.rom_count
+
+/* translate_block_*'s check after each instruction (with the cache limit):
+ * room for the tails' entries (at most one per 4 bytes of tail code) and
+ * 64 more (one instruction makes at most 16; the next block's first one
+ * comes before its first check). ROM: code and table apart by the usual
+ * threshold for the rest of the block's code. */
+#define mem_pc_full(ram_region, translation_ptr)                              \
+  ((ram_region) ?                                                             \
+   (nspire_pcs.ram_count + 64 + nspire_block_tail_bytes / 4 >                 \
+    NSPIRE_RAM_PCS_LIMIT) :                                                   \
+   ((translation_ptr) + 3 * nspire_block_tail_bytes + 64 * 8 +                \
+    TRANSLATION_CACHE_LIMIT_THRESHOLD >                                       \
+    (u8 *)(nspire_rom_pcs_top - nspire_pcs.rom_count)))                       \
+
+#ifdef NSPIRE_PCWORD_CHECK
+#define generate_mem_pc(value)                                                \
+  nspire_mem_pc_add(translation_ptr, (value));                                \
+  write32(value)                                                              \
+
+#else
+#define generate_mem_pc(value)                                                \
+  nspire_mem_pc_add(translation_ptr, (value))                                 \
+
+#endif
+#else
+#define generate_mem_pc(value)                                                \
+  write32(value)                                                              \
+
 #define generate_load_call_byte(tblnum)                                       \
   mem_calc_region(0);                                                         \
   generate_add_imm(reg_a2, (STORE_TBL_OFF + 68*tblnum + 4) >> 2, 0);          \
@@ -1368,19 +1975,20 @@ static void trace_instruction(u32 pc, u32 mode)
 #define generate_load_call_u16()        generate_load_call_mbyte(6, 1)
 #define generate_load_call_s16()        generate_load_call_mbyte(7, 1)
 #define generate_load_call_u32()        generate_load_call_mbyte(8, 2)
+#endif
 
 
 #define arm_access_memory_load(mem_type)                                      \
   cycle_count += 2;                                                           \
   generate_load_call_##mem_type();                                            \
-  write32(pc);                                                                \
+  generate_mem_pc(pc);                                                        \
   arm_generate_store_reg_pc_no_flags(reg_rv, rd)                              \
 
 #define arm_access_memory_store(mem_type)                                     \
   cycle_count++;                                                              \
   arm_generate_load_reg_pc(reg_a1, rd, 12);                                   \
   generate_store_call_##mem_type();                                           \
-  write32((pc + 4))                                                           \
+  generate_mem_pc((pc + 4))                                                   \
 
 /* Calculate the address into a0 from _rn, _rm */
 
@@ -1474,11 +2082,249 @@ static void trace_instruction(u32 pc, u32 mode)
 #define word_bit_count(word)                                                  \
   (bit_count[word >> 8] + bit_count[word & 0xFF])                             \
 
+#ifdef NSPIRE_BUILD
+/* Block transfers (push/pop, ldm/stm) on IWRAM, where GBA games keep their
+ * stack: one check that all the words are in IWRAM, then one load or store
+ * per register, instead of a call through the memory dispatch for each
+ * register (about 16 instructions apiece; every function call and return,
+ * and every interrupt, does some). Anything else runs the per-register code
+ * as before, which follows: another region, words running past the end of
+ * IWRAM's mirror, or a store whose last word holds translated code (the
+ * per-register code checks that word for self-modifying code, and stores
+ * the same values again).
+ * nspire_block_fast is 0 unless IWRAM's data is NSPIRE_IWRAM_DATA below
+ * reg_base, as arm_stub.S's .bss lays it out (checked in init_emitter).
+ *
+ * The check is a call (2026-11-15, core-12): "bl nspire_block_check_K ; b
+ * <per-register code>", the loads or stores after it. arm_stub.S's
+ * nspire_block_check (loads, push {..., lr}) and nspire_block_check_tag
+ * (the other stores: the last word's tag is checked there now, before the
+ * stores, where it was after them; the per-register code stores the same
+ * values either way and IWRAM's stores never read the old ones) make the
+ * tests the 9 + 4 inline words made, keep the flags and return past the b
+ * with r0 = the host address of the first word, or to the b. Entries are 8
+ * bytes apart, K = 1-16 words. r9 is kept; r0-r2 and lr are clobbered (no
+ * GBA register lives in them; ARM's store write-back loads r2 after). */
+#define NSPIRE_IWRAM_DATA 0xA0000
+static u32 nspire_block_fast;
+
+void nspire_block_check(void);
+void nspire_block_check_tag(void);
+
+#define nspire_block_fast_check(words, entries)                               \
+  ARM_BL(0, arm_relative_offset(translation_ptr,                              \
+   (u32)(entries) + 8 * ((words) - 1)));                                      \
+  generate_branch_filler(ARMCOND_AL, fast_slow)                               \
+
+#define nspire_block_fast_store(allocation, reg_index, word_offset)           \
+{                                                                             \
+  u32 fast_src = allocation[reg_index];                                       \
+  if(fast_src != mem_reg)                                                     \
+  {                                                                           \
+    ARM_STR_IMM(0, fast_src, reg_a0, (word_offset));                          \
+  }                                                                           \
+  else                                                                        \
+  {                                                                           \
+    ARM_LDR_IMM(0, reg_a1, reg_base, (reg_index) * 4);                        \
+    ARM_STR_IMM(0, reg_a1, reg_a0, (word_offset));                            \
+  }                                                                           \
+}                                                                             \
+
+#define nspire_block_fast_load(allocation, reg_index, word_offset)            \
+{                                                                             \
+  u32 fast_dst = allocation[reg_index];                                       \
+  if(fast_dst != mem_reg)                                                     \
+  {                                                                           \
+    ARM_LDR_IMM(0, fast_dst, reg_a0, (word_offset));                          \
+  }                                                                           \
+  else                                                                        \
+  {                                                                           \
+    ARM_LDR_IMM(0, reg_a1, reg_a0, (word_offset));                            \
+    ARM_STR_IMM(0, reg_a1, reg_base, (reg_index) * 4);                        \
+  }                                                                           \
+}                                                                             \
+
+/* After the fast path, on past the per-register code (joined at
+ * nspire_block_fast_join), which the check's b goes to. This inline form
+ * is for a block with NSPIRE_BLOCK_TAILS transfers already (see
+ * nspire_block_tail_type); the others end with the last load or store. */
+#define nspire_block_fast_end_inline()                                        \
+  generate_branch_filler(ARMCOND_AL, fast_done);                              \
+  generate_branch_patch_unconditional(fast_slow, translation_ptr)             \
+
+#define nspire_block_fast_end_tail()                                          \
+
+/* The per-register code out of line (2026-11-15, core-11): a transfer that
+ * takes the fast path (nearly all) used to run "str r9, [REG_SAVE]" and a
+ * taken "b" over the per-register code, and fetched past its dead words.
+ * Now the per-register code goes after the block's exits, in the order of
+ * the transfers: "str r9, [REG_SAVE]", the same code with the same PC
+ * words, "b" back to where the fast path continues. r9 holds the aligned
+ * base at the check's b (no GBA register lives in r9, the check keeps it).
+ * The flags are the GBA's there (the check keeps them; before core-12 the
+ * tail started with "msr cpsr_f, lr"). The cycles are counted at the
+ * transfer, once per register as before. Up to NSPIRE_BLOCK_TAILS a block;
+ * translation_cache_limit is checked with nspire_block_tail_bytes, a bound
+ * of their size (6 words a register: the PC as a 4-word constant, a
+ * write-back of 3 words and the extra word for pop {pc} or push {lr} fit in
+ * the 16 more). Translation never nests before the tails are out (the
+ * linked exits translate after them). */
+#define NSPIRE_BLOCK_TAILS 32
+
+typedef struct
+{
+  u8 *slow;                               /* the check's b                 */
+  u8 *join;
+  u32 pc;
+  u32 opcode;
+  u32 kind;
+} nspire_block_tail_type;
+
+/* 4 KB in all, so that the .bss after it keeps its place in a 4 KB way (the
+ * caches see the layout modulo 4 KB: 904 bytes moved the renderer's data and
+ * cost Dewford's drawing 0.1 ms a frame in the model). */
+/* speed10b: and the places of the branch offsets encoded since the RAM
+ * block being made started (nspire_rel_offset; reloc_n past
+ * NSPIRE_RELOC_MAX: too many, the block isn't kept), in the padding. */
+#define NSPIRE_RELOC_MAX 800
+static struct
+{
+  u32 count;
+  u32 bytes;
+  nspire_block_tail_type tails[NSPIRE_BLOCK_TAILS];
+  u32 reloc_n;
+  u32 reloc[NSPIRE_RELOC_MAX];
+  u8 pad[4096 - 8 - NSPIRE_BLOCK_TAILS * sizeof(nspire_block_tail_type) -
+   4 - NSPIRE_RELOC_MAX * 4];
+} nspire_block_tail_state;
+
+#define nspire_block_tails      nspire_block_tail_state.tails
+#define nspire_block_tail_count nspire_block_tail_state.count
+#define nspire_block_tail_bytes nspire_block_tail_state.bytes
+#define nspire_reloc_n          nspire_block_tail_state.reloc_n
+#define nspire_reloc            nspire_block_tail_state.reloc
+
+/* arm_relative_offset: a B/BL's offset field from source to target (out of
+ * line: one call where the expression was, the translator's code no
+ * bigger), source logged. */
+static __attribute__((noinline)) u32 nspire_rel_offset(u32 source, u32 target)
+{
+  u32 n = nspire_reloc_n;
+  if(n < NSPIRE_RELOC_MAX)
+    nspire_reloc[n] = source;
+  if(n <= NSPIRE_RELOC_MAX)
+    nspire_reloc_n = n + 1;
+  return ((target - source - 8) >> 2) & 0xFFFFFF;
+}
+
+#define nspire_block_tail_arm_load_no       0
+#define nspire_block_tail_arm_load_up       0
+#define nspire_block_tail_arm_load_down     0
+#define nspire_block_tail_arm_store_no      1
+#define nspire_block_tail_arm_store_up      2
+#define nspire_block_tail_arm_store_down    3
+#define nspire_block_tail_thumb_load_no     4
+#define nspire_block_tail_thumb_load_up     4
+#define nspire_block_tail_thumb_load_pop_pc 5
+#define nspire_block_tail_thumb_store_no    6
+#define nspire_block_tail_thumb_store_up    6
+#define nspire_block_tail_thumb_store_push_lr 7
+
+#define nspire_block_tail_add(kind_name, registers)                           \
+{                                                                             \
+  nspire_block_tail_type *tail =                                              \
+   &nspire_block_tails[nspire_block_tail_count++];                            \
+  tail->slow = fast_slow;                                                     \
+  tail->join = translation_ptr;                                               \
+  tail->pc = pc;                                                              \
+  tail->opcode = opcode;                                                      \
+  tail->kind = nspire_block_tail_##kind_name;                                 \
+  nspire_block_tail_bytes += 4 * (6 * (registers) + 16);                      \
+}                                                                             \
+
+#define generate_block_tails_start()                                          \
+  nspire_block_tail_count = 0;                                                \
+  nspire_block_tail_bytes = 0                                                 \
+
+#define block_tails_bytes nspire_block_tail_bytes
+
+#define nspire_block_fast_join()                                              \
+  if(fast_done)                                                               \
+  {                                                                           \
+    generate_branch_patch_unconditional(fast_done, translation_ptr);          \
+    fast_done = NULL;                                                         \
+  }                                                                           \
+
+#define nspire_block_fast_vars()                                              \
+  u8 *fast_slow = NULL;                                                       \
+  u8 *fast_done = NULL                                                        \
+
+/* ARM: stores keep their write-back for after the stores (as the
+ * per-register code does it with the last one); loads had it before. */
+#define nspire_arm_block_fast_store_end(writeback_type)                       \
+  arm_block_memory_writeback_post_store(writeback_type)                       \
+
+#define nspire_arm_block_fast_load_end(writeback_type)                        \
+
+/* The stores' check looks at the last word's tag, the loads' doesn't. */
+#define nspire_arm_block_check_store nspire_block_check_tag
+#define nspire_arm_block_check_load  nspire_block_check
+
+#define nspire_arm_block_fast_store_pc(word_offset)                           \
+  generate_load_pc(reg_a1, (pc + 12));                                        \
+  ARM_STR_IMM(0, reg_a1, reg_a0, (word_offset))                               \
+
+/* The PC last: r0 for the indirect branch that follows. */
+#define nspire_arm_block_fast_load_pc(word_offset)                            \
+  ARM_LDR_IMM(0, reg_a0, reg_a0, (word_offset));                              \
+  arm_generate_store_reg(reg_a0, 15)                                          \
+
+/* Fast path with the per-register code at the block's tail. */
+#define nspire_arm_block_tail_ok()                                            \
+  (nspire_block_fast && reg_list && (rn != 15) &&                             \
+   (nspire_block_tail_count < NSPIRE_BLOCK_TAILS))                            \
+
+#define nspire_arm_block_fast(access_type, writeback_type, end_type)          \
+  if(nspire_block_fast && reg_list && (rn != 15))                             \
+  {                                                                           \
+    u32 fast_offset = 0, fast_i;                                              \
+    nspire_block_fast_check(word_bit_count(reg_list),                         \
+     nspire_arm_block_check_##access_type);                                   \
+    for(fast_i = 0; fast_i < 16; fast_i++)                                    \
+    {                                                                         \
+      if((reg_list >> fast_i) & 0x01)                                         \
+      {                                                                       \
+        if(fast_i == 15)                                                      \
+        {                                                                     \
+          nspire_arm_block_fast_##access_type##_pc(fast_offset);              \
+        }                                                                     \
+        else                                                                  \
+        {                                                                     \
+          nspire_block_fast_##access_type(arm_register_allocation, fast_i,    \
+           fast_offset);                                                      \
+        }                                                                     \
+        fast_offset += 4;                                                     \
+      }                                                                       \
+    }                                                                         \
+    nspire_arm_block_fast_##access_type##_end(writeback_type);                \
+    nspire_block_fast_end_##end_type();                                       \
+  }                                                                           \
+
+#else
+#define nspire_block_fast_vars()
+#define nspire_block_fast_join()
+#define nspire_arm_block_tail_ok() 0
+#define nspire_arm_block_fast(access_type, writeback_type, end_type)
+#define nspire_thumb_block_tail_ok() 0
+#define nspire_thumb_block_fast(access_type, post_op, end_type)
+#define nspire_block_tail_add(kind_name, registers)
+#endif
+
 /* TODO: Make these use cached registers. Implement iwram_stack_optimize. */
 
 #define arm_block_memory_load()                                               \
   generate_load_call_u32();                                                   \
-  write32((pc + 8));                                                          \
+  generate_mem_pc((pc + 8));                                                  \
   arm_generate_store_reg(reg_rv, i)                                           \
 
 #define arm_block_memory_store()                                              \
@@ -1492,7 +2338,7 @@ static void trace_instruction(u32 pc, u32 mode)
   arm_generate_load_reg_pc(reg_a1, i, 12);                                    \
   arm_block_memory_writeback_post_store(writeback_type);                      \
   generate_store_call_u32();                                                  \
-  write32((pc + 4))                                                           \
+  generate_mem_pc((pc + 4))                                                   \
 
 #define arm_block_memory_adjust_pc_store()                                    \
 
@@ -1538,18 +2384,8 @@ static void trace_instruction(u32 pc, u32 mode)
 
 #define arm_block_memory_writeback_pre_store(writeback_type)
 
-#define arm_block_memory(access_type, offset_type, writeback_type, s_bit)     \
-{                                                                             \
-  arm_decode_block_trans();                                                   \
-  u32 offset = 0;                                                             \
-  u32 i;                                                                      \
-                                                                              \
-  arm_generate_load_reg(reg_s0, rn);                                          \
-  arm_block_memory_offset_##offset_type();                                    \
-  arm_block_memory_writeback_pre_##access_type(writeback_type);               \
-  ARM_BIC_REG_IMM(0, reg_s0, reg_s0, 0x03, 0);                                \
-  arm_generate_store_reg(reg_s0, REG_SAVE);                                   \
-                                                                              \
+/* The per-register code: base (aligned) in REG_SAVE, flags as the GBA's. */
+#define arm_block_memory_slow(access_type, writeback_type)                    \
   for(i = 0; i < 16; i++)                                                     \
   {                                                                           \
     if((reg_list >> i) & 0x01)                                                \
@@ -1569,8 +2405,35 @@ static void trace_instruction(u32 pc, u32 mode)
       }                                                                       \
     }                                                                         \
   }                                                                           \
+
+#define arm_block_memory(access_type, offset_type, writeback_type, s_bit)     \
+{                                                                             \
+  arm_decode_block_trans();                                                   \
+  u32 offset = 0;                                                             \
+  u32 i;                                                                      \
+  nspire_block_fast_vars();                                                   \
+                                                                              \
+  arm_generate_load_reg(reg_s0, rn);                                          \
+  arm_block_memory_offset_##offset_type();                                    \
+  arm_block_memory_writeback_pre_##access_type(writeback_type);               \
+  ARM_BIC_REG_IMM(0, reg_s0, reg_s0, 0x03, 0);                                \
+  if(nspire_arm_block_tail_ok())                                              \
+  {                                                                           \
+    nspire_arm_block_fast(access_type, writeback_type, tail);                 \
+    cycle_count += word_bit_count(reg_list);                                  \
+    nspire_block_tail_add(arm_##access_type##_##writeback_type,               \
+     word_bit_count(reg_list));                                               \
+  }                                                                           \
+  else                                                                        \
+  {                                                                           \
+    arm_generate_store_reg(reg_s0, REG_SAVE);                                 \
+    nspire_arm_block_fast(access_type, writeback_type, inline);               \
+    arm_block_memory_slow(access_type, writeback_type);                       \
+    nspire_block_fast_join();                                                 \
+  }                                                                           \
                                                                               \
   arm_block_memory_adjust_pc_##access_type();                                 \
+  (void)offset;                                                               \
 }                                                                             \
 
 #define arm_swap(type)                                                        \
@@ -1579,13 +2442,13 @@ static void trace_instruction(u32 pc, u32 mode)
   cycle_count += 3;                                                           \
   arm_generate_load_reg(reg_a0, rn);                                          \
   generate_load_call_##type();                                                \
-  write32((pc + 8));                                                          \
+  generate_mem_pc((pc + 8));                                                  \
   generate_mov(reg_a2, reg_rv);                                               \
   arm_generate_load_reg(reg_a0, rn);                                          \
   arm_generate_load_reg(reg_a1, rm);                                          \
   arm_generate_store_reg(reg_a2, rd);                                         \
   generate_store_call_##type();                                               \
-  write32((pc + 4));                                                          \
+  generate_mem_pc((pc + 4));                                                  \
 }                                                                             \
 
 
@@ -1748,14 +2611,14 @@ static void trace_instruction(u32 pc, u32 mode)
 #define thumb_access_memory_load(mem_type, _rd)                               \
   cycle_count += 2;                                                           \
   generate_load_call_##mem_type();                                            \
-  write32(pc);                                                                \
+  generate_mem_pc(pc);                                                        \
   thumb_generate_store_reg(reg_rv, _rd)                                       \
 
 #define thumb_access_memory_store(mem_type, _rd)                              \
   cycle_count++;                                                              \
   thumb_generate_load_reg(reg_a1, _rd);                                       \
   generate_store_call_##mem_type();                                           \
-  write32((pc + 2))                                                           \
+  generate_mem_pc((pc + 2))                                                   \
 
 #define thumb_access_memory_generate_address_pc_relative(offset, _rb, _ro)    \
   generate_load_pc(reg_a0, (offset))                                          \
@@ -1812,11 +2675,21 @@ static void trace_instruction(u32 pc, u32 mode)
 
 #define thumb_block_memory_extra_down()                                       \
 
+/* The slow PC load; the join comes before the branch (the PC in r0 either
+ * way), thumb_block_memory_after_pop_pc. */
 #define thumb_block_memory_extra_pop_pc()                                     \
   thumb_generate_load_reg(reg_s0, REG_SAVE);                                  \
   generate_add_reg_reg_imm(reg_a0, reg_s0, (bit_count[reg_list] * 4), 0);     \
   generate_load_call_u32();                                                   \
-  write32((pc + 4));                                                          \
+  generate_mem_pc((pc + 4))                                                   \
+
+#define thumb_block_memory_after_no()                                         \
+
+#define thumb_block_memory_after_up()                                         \
+
+#define thumb_block_memory_after_push_lr()                                    \
+
+#define thumb_block_memory_after_pop_pc()                                     \
   generate_indirect_branch_cycle_update(thumb)                                \
 
 #define thumb_block_memory_extra_push_lr(base_reg)                            \
@@ -1827,7 +2700,7 @@ static void trace_instruction(u32 pc, u32 mode)
 
 #define thumb_block_memory_load()                                             \
   generate_load_call_u32();                                                   \
-  write32((pc + 4));                                                          \
+  generate_mem_pc((pc + 4));                                                  \
   thumb_generate_store_reg(reg_rv, i)                                         \
 
 #define thumb_block_memory_store()                                            \
@@ -1840,7 +2713,7 @@ static void trace_instruction(u32 pc, u32 mode)
 #define thumb_block_memory_final_store()                                      \
   thumb_generate_load_reg(reg_a1, i);                                         \
   generate_store_call_u32();                                                  \
-  write32((pc + 2))                                                           \
+  generate_mem_pc((pc + 2))                                                   \
 
 #define thumb_block_memory_final_no(access_type)                              \
   thumb_block_memory_final_##access_type()                                    \
@@ -1857,18 +2730,69 @@ static void trace_instruction(u32 pc, u32 mode)
 #define thumb_block_memory_final_pop_pc(access_type)                          \
   thumb_block_memory_##access_type()                                          \
 
-#define thumb_block_memory(access_type, pre_op, post_op, base_reg)            \
-{                                                                             \
-  thumb_decode_rlist();                                                       \
-  u32 i;                                                                      \
-  u32 offset = 0;                                                             \
-                                                                              \
-  thumb_generate_load_reg(reg_s0, base_reg);                                  \
-  ARM_BIC_REG_IMM(0, reg_s0, reg_s0, 0x03, 0);                                \
-  thumb_block_address_preadjust_##pre_op();                                   \
-  thumb_block_address_postadjust_##post_op(base_reg);                         \
-  thumb_generate_store_reg(reg_s0, REG_SAVE);                                 \
-                                                                              \
+#ifdef NSPIRE_BUILD
+/* Thumb block transfers on IWRAM (see nspire_block_fast_check). The words
+ * after the listed registers: LR for push {..., lr}, the PC for pop {...,
+ * pc}. The per-register code checks the last word of push (without LR) and
+ * stmia for self-modifying code, never push {..., lr}'s; so does the check
+ * (below). */
+#define nspire_thumb_block_words_no      0
+#define nspire_thumb_block_words_up      0
+#define nspire_thumb_block_words_down    0
+#define nspire_thumb_block_words_push_lr 1
+#define nspire_thumb_block_words_pop_pc  1
+
+/* The check: with the last word's tag for push and stmia (the last listed
+ * register's word), without for push {..., lr} and the loads. */
+#define nspire_thumb_block_check_store_no      nspire_block_check_tag
+#define nspire_thumb_block_check_store_up      nspire_block_check_tag
+#define nspire_thumb_block_check_store_down    nspire_block_check_tag
+#define nspire_thumb_block_check_store_push_lr nspire_block_check
+#define nspire_thumb_block_check_load_no       nspire_block_check
+#define nspire_thumb_block_check_load_up       nspire_block_check
+#define nspire_thumb_block_check_load_down     nspire_block_check
+#define nspire_thumb_block_check_load_pop_pc   nspire_block_check
+
+#define nspire_thumb_block_fast_tail_no(access_type, word_offset)             \
+
+#define nspire_thumb_block_fast_tail_up(access_type, word_offset)             \
+
+#define nspire_thumb_block_fast_tail_down(access_type, word_offset)           \
+
+#define nspire_thumb_block_fast_tail_push_lr(access_type, word_offset)        \
+  nspire_block_fast_store(thumb_register_allocation, REG_LR, (word_offset))   \
+
+#define nspire_thumb_block_fast_tail_pop_pc(access_type, word_offset)         \
+  ARM_LDR_IMM(0, reg_a0, reg_a0, (word_offset))                               \
+
+#define nspire_thumb_block_tail_ok()                                          \
+  (nspire_block_fast && reg_list &&                                           \
+   (nspire_block_tail_count < NSPIRE_BLOCK_TAILS))                            \
+
+#define nspire_thumb_block_fast(access_type, post_op, end_type)               \
+  if(nspire_block_fast && reg_list)                                           \
+  {                                                                           \
+    u32 fast_offset = 0, fast_i;                                              \
+    nspire_block_fast_check(bit_count[reg_list] +                             \
+     nspire_thumb_block_words_##post_op,                                      \
+     nspire_thumb_block_check_##access_type##_##post_op);                     \
+    for(fast_i = 0; fast_i < 8; fast_i++)                                     \
+    {                                                                         \
+      if((reg_list >> fast_i) & 0x01)                                         \
+      {                                                                       \
+        nspire_block_fast_##access_type(thumb_register_allocation, fast_i,    \
+         fast_offset);                                                        \
+        fast_offset += 4;                                                     \
+      }                                                                       \
+    }                                                                         \
+    nspire_thumb_block_fast_tail_##post_op(access_type, fast_offset);         \
+    nspire_block_fast_end_##end_type();                                       \
+  }                                                                           \
+
+#endif
+
+/* The per-register code: base (adjusted, aligned) in REG_SAVE. */
+#define thumb_block_memory_slow(access_type, post_op)                         \
   for(i = 0; i < 8; i++)                                                      \
   {                                                                           \
     if((reg_list >> i) & 0x01)                                                \
@@ -1889,9 +2813,158 @@ static void trace_instruction(u32 pc, u32 mode)
     }                                                                         \
   }                                                                           \
                                                                               \
-  thumb_block_memory_extra_##post_op();                                       \
+  thumb_block_memory_extra_##post_op()                                        \
+
+#define thumb_block_memory(access_type, pre_op, post_op, base_reg)            \
+{                                                                             \
+  thumb_decode_rlist();                                                       \
+  u32 i;                                                                      \
+  u32 offset = 0;                                                             \
+  nspire_block_fast_vars();                                                   \
+                                                                              \
+  thumb_generate_load_reg(reg_s0, base_reg);                                  \
+  ARM_BIC_REG_IMM(0, reg_s0, reg_s0, 0x03, 0);                                \
+  thumb_block_address_preadjust_##pre_op();                                   \
+  thumb_block_address_postadjust_##post_op(base_reg);                         \
+  if(nspire_thumb_block_tail_ok())                                            \
+  {                                                                           \
+    nspire_thumb_block_fast(access_type, post_op, tail);                      \
+    cycle_count += bit_count[reg_list];                                       \
+    nspire_block_tail_add(thumb_##access_type##_##post_op,                    \
+     bit_count[reg_list]);                                                    \
+  }                                                                           \
+  else                                                                        \
+  {                                                                           \
+    thumb_generate_store_reg(reg_s0, REG_SAVE);                               \
+    nspire_thumb_block_fast(access_type, post_op, inline);                    \
+    thumb_block_memory_slow(access_type, post_op);                            \
+    nspire_block_fast_join();                                                 \
+  }                                                                           \
+                                                                              \
+  thumb_block_memory_after_##post_op();                                       \
+  (void)offset;                                                               \
 }                                                                             \
 
+#ifdef NSPIRE_BUILD
+/* One transfer's per-register code at the block's tail (see
+ * nspire_block_tail_type); returns the new translation_ptr. */
+static u8 *nspire_block_tail_emit(u8 *translation_ptr,
+ const nspire_block_tail_type *tail)
+{
+  u32 opcode = tail->opcode;
+  u32 pc = tail->pc;
+  u32 cycle_count = 0;                    /* counted at the transfer       */
+  u32 offset = 0;
+  u32 i;
+  u8 *join_branch;
+
+  generate_branch_patch_unconditional(tail->slow, translation_ptr);
+  arm_generate_store_reg(reg_s0, REG_SAVE);
+
+  switch(tail->kind)
+  {
+    case nspire_block_tail_arm_load_no:
+    {
+      arm_decode_block_trans();
+      arm_block_memory_slow(load, no);
+      (void)rn;
+      break;
+    }
+    case nspire_block_tail_arm_store_no:
+    {
+      arm_decode_block_trans();
+      arm_block_memory_slow(store, no);
+      (void)rn;
+      break;
+    }
+    case nspire_block_tail_arm_store_up:
+    {
+      arm_decode_block_trans();
+      arm_block_memory_slow(store, up);
+      break;
+    }
+    case nspire_block_tail_arm_store_down:
+    {
+      arm_decode_block_trans();
+      arm_block_memory_slow(store, down);
+      break;
+    }
+    case nspire_block_tail_thumb_load_up:
+    {
+      thumb_decode_rlist();
+      thumb_block_memory_slow(load, up);
+      break;
+    }
+    case nspire_block_tail_thumb_load_pop_pc:
+    {
+      thumb_decode_rlist();
+      thumb_block_memory_slow(load, pop_pc);
+      break;
+    }
+    case nspire_block_tail_thumb_store_up:
+    {
+      thumb_decode_rlist();
+      thumb_block_memory_slow(store, up);
+      break;
+    }
+    case nspire_block_tail_thumb_store_push_lr:
+    {
+      thumb_decode_rlist();
+      thumb_block_memory_slow(store, push_lr);
+      break;
+    }
+  }
+
+  generate_branch_filler(ARMCOND_AL, join_branch);
+  generate_branch_patch_unconditional(join_branch, tail->join);
+  (void)cycle_count;
+  (void)offset;
+  return translation_ptr;
+}
+
+/* After the block's exits: every transfer's per-register code. */
+#define generate_block_tails()                                                \
+{                                                                             \
+  u32 tail_i;                                                                 \
+  for(tail_i = 0; tail_i < nspire_block_tail_count; tail_i++)                 \
+  {                                                                           \
+    translation_ptr = nspire_block_tail_emit(translation_ptr,                 \
+     &nspire_block_tails[tail_i]);                                            \
+  }                                                                           \
+  nspire_block_tail_count = 0;                                                \
+  nspire_block_tail_bytes = 0;                                                \
+}                                                                             \
+
+#endif
+
+#ifdef NSPIRE_BUILD
+/* core-16: a pure idle loop's branch, and its exit disarmed. */
+#define thumb_conditional_branch(condition)                                   \
+{                                                                             \
+  u32 idle_pure = nspire_idle_pure(                                           \
+   block_exits[block_exit_position].branch_target, (opcode >> 8) & 0xF);      \
+  generate_cycle_update();                                                    \
+  generate_branch_filler(condition_opposite_##condition, backpatch_address);  \
+  if(idle_pure)                                                               \
+  {                                                                           \
+    generate_branch_idle_pure(block_exits[block_exit_position].branch_source, \
+     block_exits[block_exit_position].branch_target);                         \
+  }                                                                           \
+  else                                                                        \
+  {                                                                           \
+    generate_branch_no_cycle_update(                                          \
+     block_exits[block_exit_position].branch_source,                          \
+     block_exits[block_exit_position].branch_target, thumb);                  \
+  }                                                                           \
+  generate_branch_patch_conditional(backpatch_address, translation_ptr);      \
+  if(idle_pure)                                                               \
+  {                                                                           \
+    generate_idle_disarm();                                                   \
+  }                                                                           \
+  block_exit_position++;                                                      \
+}                                                                             \
+
+#else
 #define thumb_conditional_branch(condition)                                   \
 {                                                                             \
   generate_cycle_update();                                                    \
@@ -1902,6 +2975,8 @@ static void trace_instruction(u32 pc, u32 mode)
   generate_branch_patch_conditional(backpatch_address, translation_ptr);      \
   block_exit_position++;                                                      \
 }                                                                             \
+
+#endif
 
 
 #define arm_conditional_block_header()                                        \
@@ -1928,8 +3003,27 @@ static void trace_instruction(u32 pc, u32 mode)
   write32((pc + 4));                                                          \
   generate_branch(arm)                                                        \
 
+#ifdef NSPIRE_BUILD
+#define thumb_b()                                                             \
+{                                                                             \
+  if(nspire_idle_pure(block_exits[block_exit_position].branch_target, 14))   \
+  {                                                                           \
+    generate_cycle_update();                                                  \
+    generate_branch_idle_pure(block_exits[block_exit_position].branch_source, \
+     block_exits[block_exit_position].branch_target);                         \
+    block_exit_position++;                                                    \
+  }                                                                           \
+  else                                                                        \
+  {                                                                           \
+    generate_branch(thumb)                                                    \
+  }                                                                           \
+}                                                                             \
+
+#else
 #define thumb_b()                                                             \
   generate_branch(thumb)                                                      \
+
+#endif
 
 #define thumb_bl()                                                            \
   generate_update_pc(((pc + 2) | 0x01));                                      \
@@ -1991,10 +3085,34 @@ extern u32 ld_swap_handler_functions[5][17];
 // Tables used by the memory handlers (placed near reg_base)
 extern u32 ld_lookup_tables[5][17];
 extern u32 st_lookup_tables[4][17];
+#ifdef NSPIRE_BUILD
+// mem_dispatch's 256-entry tables, indexed by the address's top byte
+// (arm_stub.S; stores u8, u16, u32, u32_safe, loads u8, s8, u16, s16, u32)
+extern u32 *nspire_mem_tables[9];
+#endif
 
 void init_emitter(bool must_swap) {
   int i;
 
+#ifdef NSPIRE_BUILD
+  nspire_block_fast = (u8 *)reg - (iwram + 0x8000) == NSPIRE_IWRAM_DATA;
+#endif
+
+#ifdef NSPIRE_BUILD
+  // mem_dispatch's 256-entry tables (arm_stub.S): entry b is the 17-entry
+  // table's entry b + 1 for regions 0x00-0x0F, its "-1" entry above.
+  {
+    const u32 *ld = must_swap ? &ld_swap_handler_functions[0][0] : &ld_handler_functions[0][0];
+    int t;
+    for (t = 0; t < 9; t++)
+    {
+      const u32 *src = t < 4 ? st_handler_functions[t] : ld + 17 * (t - 4);
+      u32 *dst = nspire_mem_tables[t];
+      for (i = 0; i < 256; i++)
+        dst[i] = src[i < 16 ? i + 1 : 0];
+    }
+  }
+#else
   // Generate handler table
   memcpy(st_lookup_tables, st_handler_functions, sizeof(st_lookup_tables));
   // Issue faster paths if swapping is not required
@@ -2002,8 +3120,16 @@ void init_emitter(bool must_swap) {
     memcpy(ld_lookup_tables, ld_swap_handler_functions, sizeof(ld_lookup_tables));
   else
     memcpy(ld_lookup_tables, ld_handler_functions, sizeof(ld_lookup_tables));
+#endif
 
   rom_cache_watermark = INITIAL_ROM_WATERMARK;
+#ifdef NSPIRE_BUILD
+  /* core-17: the ROM cache is made anew from its start */
+  nspire_pcs.rom_count = 0;
+  nspire_pcs.rom_kept = 0;
+  nspire_pcs.pending &= ~2u;
+  mem_pc_cache_clear();
+#endif
   u8 *translation_ptr = (u8*)&rom_translation_cache[0];
 
   // Generate ARMv5+ division code, uses a mix of libgcc and some open bioses.
@@ -2068,6 +3194,10 @@ void init_emitter(bool must_swap) {
   // Intialize function table
   reg[REG_USERDEF + armfn_gbaup_idle_arm]   = (u32)arm_update_gba_idle_arm;
   reg[REG_USERDEF + armfn_gbaup_idle_thumb] = (u32)arm_update_gba_idle_thumb;
+#ifdef NSPIRE_BUILD
+  reg[REG_USERDEF + armfn_gbaup_idle_pass_thumb] =
+   (u32)arm_update_gba_idle_pass_thumb;
+#endif
   reg[REG_USERDEF + armfn_gbaup_arm]   = (u32)arm_update_gba_arm;
   reg[REG_USERDEF + armfn_gbaup_thumb] = (u32)arm_update_gba_thumb;
   reg[REG_USERDEF + armfn_swi_arm]   = (u32)execute_swi_arm;

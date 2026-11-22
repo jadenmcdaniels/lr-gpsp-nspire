@@ -1,0 +1,6 @@
+# Pokemon Emerald, the reference CX state 26 (Dewford Town's Pokemon Center):
+# walk down, left, right and up through the room. FROM TO KEY.
+10 330 DOWN
+340 420 LEFT
+430 520 RIGHT
+530 600 UP

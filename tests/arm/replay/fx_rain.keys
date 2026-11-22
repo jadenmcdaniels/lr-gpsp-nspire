@@ -1,0 +1,12 @@
+# Pokemon Emerald, Route 119 in the rain (tests/emerald_fx_states.py rain and storm): 8 tiles
+# down the path at x 25 and back (north, y 31 is the rival's trigger and y 13 the Weather
+# Institute's sun; no trainer sees this path).
+# FROM TO KEY (replay.c); one tile is 16 frames.
+10 136 DOWN
+142 268 UP
+274 400 DOWN
+406 532 UP
+538 664 DOWN
+670 796 UP
+802 928 DOWN
+934 1060 UP

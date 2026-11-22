@@ -24,8 +24,14 @@
 #define SERIAL_MODE_SERIAL_AW1    4  // Connected to serial cable (AdvWars emulation mode)
 #define SERIAL_MODE_SERIAL_AW2    5  // Connected to serial cable (AdvWars emulation mode)
 #define SERIAL_MODE_AUTO          6  // Choose best fit automatically
+#define SERIAL_MODE_CABLE         7  // A real link cable to another emulator (nspire_link.c)
+#define SERIAL_MODE_SERIAL_FE     8  // Connected to serial cable (Fire Emblem emulation mode)
+#define SERIAL_MODE_SERIAL_MSIO   9  // Connected to serial cable (Nintendo MultiSio library, serial_msio.c)
 
 extern int serial_mode;
+extern int cable_linked;
+// nspire R4: transfers the game started, serial events that came (the link's log).
+extern u32 serial_transfer_starts, serial_irqs_raised;
 
 // Register writes
 cpu_alert_type write_siocnt(u16 value);
@@ -48,12 +54,41 @@ void serialproto_reset(void);
 void serialpoke_frame_update(void);
 void serialpoke_master_send(void);
 bool serialpoke_update(unsigned cycles);
+u32 serialpoke_states(void);
 void serialpoke_net_receive(const void* buf, size_t len, uint16_t client_id);
 
 void serialaw_frame_update(void);
 void serialaw_master_send(void);
 bool serialaw_update(unsigned cycles);
 void serialaw_net_receive(const void* buf, size_t len, uint16_t client_id);
+
+// Fire Emblem's (serial_fe.c)
+void serialfe_reset(void);
+void serialfe_master_send(void);
+bool serialfe_update(unsigned cycles);
+void serialfe_net_receive(const void* buf, size_t len, uint16_t client_id);
+
+// The Nintendo MultiSio library's (serial_msio.c)
+void serialmsio_reset(void);
+void serialmsio_master_send(u32 time);
+void serialmsio_frame_update(void);
+void serialmsio_update(unsigned cycles);
+void serialmsio_net_receive(const void* buf, size_t len, uint16_t client_id);
+
+// Link cable interface (the frontend's: nspire_link.c). The parent's
+// transfer start waits for the other GBA's word; the other GBA stops at
+// that same cycle to give it, so both finish the transfer together.
+// Never inlined (LTO would put the link into update_gba, which then differs
+// between the calculator build and the speed model's, whose link is
+// tests/arm/link_stubs.c, and spreads the hot code over more cache lines).
+__attribute__((noipa)) void cable_transfer_start(u16 siocnt, u32 cycles);
+__attribute__((noipa)) void cable_transfer_done(void);
+__attribute__((noipa)) void cable_update(unsigned cycles);
+__attribute__((noipa)) u32 cable_next_event(void);
+void serial_cable_busy(u32 cycles);
+u32 serial_busy_cycles(void);
+// How long the halted CPU surely stays so (main.c), to answer sooner.
+u32 halted_cycles(u32 serial_busy);
 
 // GBP interface
 u32 gbp_transfer(u32 value);

@@ -36,8 +36,8 @@
 }
 
 #define bson_read_u32(p)                        \
-  ((p[3] << 24) | (p[2] << 16) |                \
-   (p[1] <<  8) | (p[0] <<  0))
+  (((u32)p[3] << 24) | ((u32)p[2] << 16) |                \
+   ((u32)p[1] <<  8) | ((u32)p[0] <<  0))
 
 #define bson_write_cstring(p, value)            \
   memcpy(p, value, strlen(value)+1);            \
@@ -88,6 +88,9 @@
 
 bool bson_contains_key(const u8 *srcp, const char *key, u8 keytype);
 const u8* bson_find_key(const u8 *srcp, const char *key);
+const u8* bson_find_document(const u8 *srcp, const char *key);
+bool bson_check_int32_array(const u8 *srcp, const char *key, unsigned cnt);
+bool bson_check_bytes(const u8 *srcp, const char *key, unsigned cnt);
 bool bson_read_int32(const u8 *srcp, const char *key, u32* value);
 bool bson_read_int32_array(const u8 *srcp, const char *key, u32* value, unsigned cnt);
 bool bson_read_bytes(const u8 *srcp, const char *key, void* buffer, unsigned cnt);

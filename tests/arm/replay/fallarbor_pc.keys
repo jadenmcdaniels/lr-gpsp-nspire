@@ -1,0 +1,8 @@
+# Pokemon Emerald, the reference CX II state 31 (Fallarbor Town's Pokemon
+# Center, the Cable Club floor: tests/emerald_where.py says map group 5
+# number 5): walk down, left, right and up through the room, as
+# dewford_pc.keys. FROM TO KEY.
+10 330 DOWN
+340 420 LEFT
+430 520 RIGHT
+530 600 UP

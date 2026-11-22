@@ -1,0 +1,109 @@
+--- a/libretro-gpsp/sound.c
++++ b/libretro-gpsp/sound.c
+@@ -44,6 +44,10 @@
+ static u32 sound_buffer_base;
+ 
+ static fixed16_16 gbc_sound_tick_step;
++u32 st_timer_calls[2], st_timer_out[2], st_timer_status[2][4], st_timer_nonzero[2];
++u32 st_step_min[2] = { 0xFFFFFFFF, 0xFFFFFFFF }, st_step_max[2];
++u32 st_render_calls, st_render_ticks, st_render_ch[4], st_ch_on_calls[4], st_ch_routed_calls[4];
++u32 st_dma_calls[2], st_aud[4];
+ 
+ /* Queue 4 samples to the top of the DS FIFO, wrap around circularly */
+ 
+@@ -88,6 +92,7 @@
+ #else
+   u32 sample_status = DIRECT_SOUND_INACTIVE;
+   s16 current_sample, next_sample;
++  u32 st_start = buffer_index;
+ 
+   current_sample = ds->fifo[ds->fifo_base] * 16;
+   ds->fifo_base = (ds->fifo_base + 1) % 32;
+@@ -164,6 +169,12 @@
+ 
+   ds->buffer_index = buffer_index;
+   ds->fifo_fractional = fp8_24_fractional_part(fifo_fractional);
++  st_timer_calls[channel]++;
++  st_timer_out[channel] += ((buffer_index - st_start) & BUFFER_SIZE_MASK) / 2;
++  st_timer_status[channel][sample_status]++;
++  if (current_sample) st_timer_nonzero[channel]++;
++  if (frequency_step < st_step_min[channel]) st_step_min[channel] = frequency_step;
++  if (frequency_step > st_step_max[channel]) st_step_max[channel] = frequency_step;
+ 
+   if(((ds->fifo_top - ds->fifo_base) % 32) <= 16)
+   {
+@@ -498,8 +509,16 @@
+     gbc_sound_partial_ticks &= 0xFFFF;
+   }
+ 
++  st_render_calls++;
++  st_render_ticks += buffer_ticks;
+   if(sound_on == 1)
+   {
++    int st_i;
++    for (st_i = 0; st_i < 4; st_i++)
++    {
++      gbc_sound_struct *g = gbc_sound_channel + st_i;
++      if (g->active_flag && (st_i != 2 || g->master_enable)) { st_ch_on_calls[st_i]++; if (g->status && (st_i == 2 ? g->wave_volume : g->envelope_volume)) st_aud[st_i]++; if (g->status) { st_ch_routed_calls[st_i]++; st_render_ch[st_i] += buffer_ticks; } }
++    }
+     s8 *wave_bank;
+     gs = gbc_sound_channel + 0;
+     if(gs->active_flag)
+--- a/tests/audio/perf_audio.h
++++ b/tests/audio/perf_audio.h
+@@ -18,6 +18,7 @@
+  * own function (part "audio").
+  */
+ 
++static int st_from = -1;
+ #define PERF_AUDIO_CHUNK 256   /* frames per read */
+ 
+ static FILE *perf_audio_wav;
+@@ -52,6 +53,7 @@
+ static void perf_audio_init(int argc, char **argv)
+ {
+   const char *path = text_setting(argc, argv, "wav");
++  st_from = setting(argc, argv, "statfrom", -1);
+   perf_audio_wav_from = setting(argc, argv, "wavfrom", 1);
+   perf_audio_wav_to = setting(argc, argv, "wavto", 0x7FFFFFFF);
+   if (path)
+@@ -64,6 +66,24 @@
+   }
+ }
+ 
++extern u32 st_timer_calls[2], st_timer_out[2], st_timer_status[2][4], st_timer_nonzero[2];
++extern u32 st_aud[4];
++extern u32 st_step_min[2], st_step_max[2];
++extern u32 st_render_calls, st_render_ticks, st_render_ch[4], st_ch_on_calls[4], st_ch_routed_calls[4];
++static void st_print(int frame)
++{
++  int c;
++  printf("SST %d tcalls %u %u out %u %u nz %u %u status A %u %u %u %u B %u %u %u %u step %u %u %u %u rcalls %u rticks %u ch %u %u %u %u on %u %u %u %u routed %u %u %u %u aud %u %u %u %u\n",
++    frame, st_timer_calls[0], st_timer_calls[1], st_timer_out[0], st_timer_out[1], st_timer_nonzero[0], st_timer_nonzero[1],
++    st_timer_status[0][0], st_timer_status[0][1], st_timer_status[0][2], st_timer_status[0][3],
++    st_timer_status[1][0], st_timer_status[1][1], st_timer_status[1][2], st_timer_status[1][3],
++    st_step_min[0], st_step_max[0], st_step_min[1], st_step_max[1], st_render_calls, st_render_ticks,
++    st_render_ch[0], st_render_ch[1], st_render_ch[2], st_render_ch[3],
++    st_ch_on_calls[0], st_ch_on_calls[1], st_ch_on_calls[2], st_ch_on_calls[3],
++    st_ch_routed_calls[0], st_ch_routed_calls[1], st_ch_routed_calls[2], st_ch_routed_calls[3], st_aud[0], st_aud[1], st_aud[2], st_aud[3]);
++  (void)c;
++}
++
+ /* The end of a frame: drain the mixer; at a hash frame print the hashes. */
+ void __attribute__((noinline)) perf_audio_frame(int frame, int print)
+ {
+@@ -85,12 +105,14 @@
+       perf_audio_wav_samples += count;
+     }
+   }
++  if (frame == st_from) st_print(frame);
+   if (print)
+     printf("audio %d %08x %u\n", frame, (unsigned)perf_audio_hash, (unsigned)perf_audio_samples);
+ }
+ 
+ static void perf_audio_finish(void)
+ {
++  st_print(-1);
+   if (perf_audio_wav)
+   {
+     fseek(perf_audio_wav, 0, SEEK_SET);

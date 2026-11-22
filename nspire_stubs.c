@@ -4,8 +4,11 @@
 #include "main.h"
 #include "cpu.h"
 #include "gba_memory.h"
+#include "nspire_frameskip.h"
+#include "nspire_gui_video.h"
 
 #include <stddef.h>
+#include <stdlib.h>
 #include <stdint.h>
 
 int dynarec_enable = 1;
@@ -23,8 +26,6 @@ u32 nspire_lcd_cache_clean_full = 0;
 u32 nspire_fps_overlay = 0;
 /* 1 = skip PPU BLDCNT blending / brightness passes (performance; inaccurate). */
 u32 nspire_gba_blend_off = 0;
-/* 0 = libretro video.cc renderer; 1 = legacy old_video/video.c renderer. */
-u32 nspire_video_renderer_choice = 0;
 /* 0 = partial SMC (default); 1 = classic — flush_dynarec_caches on SMC + full
  * PC-relative block linking from RAM code (same emits as ROM blocks). */
 u32 nspire_dynarec_ram_policy = 0;
@@ -34,15 +35,6 @@ boot_mode selected_boot_mode = boot_game;
 int sprite_limit = 1;
 u32 num_skipped_frames = 0;
 u32 skip_next_frame = 0;
-
-void netpacket_send(uint16_t client_id, const void *buf, size_t len)
-{
-  (void)client_id;
-  (void)buf;
-  (void)len;
-}
-
-void netpacket_poll_receive(void) {}
 
 u32 idle_loop_target_pc = 0xFFFFFFFF;
 u32 translation_gate_target_pc[MAX_TRANSLATION_GATES];
@@ -63,6 +55,44 @@ u32 quick_save_slot = 0;
 gpsp_gui_cheat_entry cheats[16];
 u32 num_cheats = 0;
 
+/* r19: the choices that only decided speed are made for the player, and their tiles are gone (the fast
+ * choice is the default and has no tile, so the settings stay few; an instability it brings is fixed in
+ * the code, not given a tile to turn the fast choice off). Whatever a settings file
+ * says (files from older builds' menus can have frame mixing on and the smoothed picture): automatic
+ * frame skip, no frame mixing, the fast handling of code in RAM and fast forward without a top speed. Two are
+ * fixed the other way, for the picture: Fit is drawn smoothed, and Transparency stays ON: without it fog, water and fades are simply missing, which is a wrong
+ * picture, not a slower one. Not here: CPU speed, Fast memory and the link's speed, which turn themselves down
+ * after a freeze and must stay down (nspire_clock.c, nspire_sram.c, nspire_link.c).
+ * The PC build keeps what a file says unless GPSP_HOST_FAST is set: its tests of the frame skip's other modes
+ * and of fast forward's top speeds go through settings files. */
+int nspire_fast_settings = 1;
+
+void nspire_config_fast(void)
+{
+#if defined(NSPIRE_HOST)
+  {
+    static int asked;
+    if (!asked)
+    {
+      asked = 1;
+      nspire_fast_settings = getenv("GPSP_HOST_FAST") != NULL;
+    }
+  }
+#endif
+  if (!nspire_fast_settings)
+    return;
+  /* (frame skip is the player's again: after a time fixed to Auto, its setting came back. More has its
+   * tile, Auto or Off.) */
+  nspire_frame_mix_choice = 0;
+  nspire_dynarec_ram_policy = 0;
+  nspire_gba_blend_off = 0;
+  nspire_ff_max = NSPIRE_FF_UNLIMITED;
+  /* (Fit is the smoothed one, always: on the calculator the sharp one looked like a picture that should
+   * have been smoothed) */
+  if (screen_scale == scaled_raw)
+    screen_scale = scaled_aspect;
+}
+
 void nspire_emulator_options_apply(void)
 {
   static u32 last_mix = (u32)-1;
@@ -71,11 +101,11 @@ void nspire_emulator_options_apply(void)
   static u32 last_block_reuse;
   static u32 block_reuse_seen;
 
+  nspire_config_fast();
   if (nspire_rom_buffer_size_choice < 2)
     nspire_rom_buffer_size_choice = 2;
   else if (nspire_rom_buffer_size_choice > 32)
     nspire_rom_buffer_size_choice = 32;
-  nspire_video_renderer_choice %= 2;
 
   sprite_limit = (nspire_sprlim_choice == 0) ? 1 : 0;
   if (last_mix != nspire_frame_mix_choice)

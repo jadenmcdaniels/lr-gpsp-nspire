@@ -1,0 +1,17 @@
+# Pokemon Emerald, Route 111's desert in the sandstorm: 4 tiles east on the path and back.
+# FROM TO KEY (replay.c); one tile is 16 frames.
+10 72 RIGHT
+78 140 LEFT
+146 208 RIGHT
+214 276 LEFT
+282 344 RIGHT
+350 412 LEFT
+418 480 RIGHT
+486 548 LEFT
+554 616 RIGHT
+622 684 LEFT
+690 752 RIGHT
+758 820 LEFT
+826 888 RIGHT
+894 956 LEFT
+962 1024 RIGHT

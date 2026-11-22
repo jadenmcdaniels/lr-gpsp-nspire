@@ -1,0 +1,2 @@
+# cx2, made by hand (not from make_traces.sh): a steady scene whose drawn frame (14.75 ms with the touchpad) is just over a refresh less FF_MARGIN: game drawing picture (ms) a frame
+6.0 4.3 4.05

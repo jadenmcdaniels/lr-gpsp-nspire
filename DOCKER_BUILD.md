@@ -2,61 +2,6 @@
 
 This document describes the **`ndless-dev`** Docker Compose service used to build **`gpsp_libretro.tns`** without installing the Ndless SDK on the host.
 
-**For assistants (Cursor, etc.):** read **§ This machine (current host)** first when rebuilding or debugging Docker; it records the resolved paths and versions on the maintainer’s Windows box so instructions stay consistent across sessions.
-
----
-
-## This machine (current host)
-
-Captured from the environment used for day-to-day builds. Re-run the commands in *Verification* if anything drifts (Docker upgrade, image rebuild, repo moved).
-
-| Item | Value |
-|------|--------|
-| **OS** | Windows 10 / 11 (build 26200 family), **PowerShell** (avoid `&&` for chaining; use `Set-Location` then a new line or `;`). |
-| **Repo root** | `C:\Users\Owner\Downloads\nspire\gpsp-master` |
-| **Standalone project** | `C:\Users\Owner\Downloads\nspire\gpsp-master\nspire-libretro-standalone` |
-| **Compose project name** | `nspire-libretro-standalone` (directory name; see `docker compose config`) |
-| **Docker Engine** | `27.1.1` (build `6312585`) |
-| **Docker Compose** | `v2.29.1-desktop.1` (Docker Desktop bundle) |
-| **Build image (default)** | `ndless-dev:latest` — image ID at last check: `60908c305bec` (~3.98 GiB) |
-| **`NSPIRE_BUILD_IMAGE`** | Not set; no `.env` next to `docker-compose.yml` (Compose uses default `ndless-dev:latest`). |
-| **Resolved bind mount** | Host `C:\Users\Owner\Downloads\nspire\gpsp-master` → container `/work` |
-| **Container working dir** | `/work/nspire-libretro-standalone` |
-
-**Other images present locally (not used by default Compose):** `bensuperpc/ndless:latest` may also exist; the Makefile/compose path expects **`ndless-dev:latest`** unless you override `NSPIRE_BUILD_IMAGE`.
-
-### Copy-paste build (PowerShell)
-
-From anywhere:
-
-```powershell
-Set-Location "C:\Users\Owner\Downloads\nspire\gpsp-master\nspire-libretro-standalone"
-docker compose run --rm ndless-dev make -j2
-```
-
-Clean rebuild:
-
-```powershell
-Set-Location "C:\Users\Owner\Downloads\nspire\gpsp-master\nspire-libretro-standalone"
-docker compose run --rm ndless-dev make clean all
-```
-
-Outputs **`gpsp_libretro.elf`** and **`gpsp_libretro.tns`** on the host under the standalone directory (bind mount writes through to Windows).
-
-### Verification (refresh machine facts)
-
-```powershell
-Set-Location "C:\Users\Owner\Downloads\nspire\gpsp-master\nspire-libretro-standalone"
-docker --version
-docker compose version
-docker compose config
-docker images ndless-dev
-```
-
-`docker compose config` should show `source: C:\Users\Owner\Downloads\nspire\gpsp-master` and `target: /work`, `working_dir: /work/nspire-libretro-standalone`.
-
----
-
 ## What it does (general)
 
 - Runs a container that provides the **Ndless cross-toolchain** (`nspire-gcc`, `nspire-g++`, `genzehn`, and related tools) on Linux.
@@ -65,7 +10,7 @@ docker images ndless-dev
 
 The Compose file is [`docker-compose.yml`](./docker-compose.yml).
 
-## Prerequisites (any machine)
+## Prerequisites
 
 1. **Docker** with Compose v2 (`docker compose` subcommand).
 2. A local image tagged **`ndless-dev:latest`** (default), **or** another image/tag via **`NSPIRE_BUILD_IMAGE`**.
@@ -85,7 +30,7 @@ docker compose run --rm ndless-dev make
 
 On **Windows PowerShell**: `$env:NSPIRE_BUILD_IMAGE = "myregistry/ndless-sdk:2024"` before `docker compose`, or a `.env` file beside `docker-compose.yml`.
 
-## Typical commands (generic)
+## Typical commands
 
 From **`nspire-libretro-standalone`** (same directory as `docker-compose.yml`):
 
@@ -127,7 +72,7 @@ The Makefile passes **`genzehn`** flags such as **`--ndless-min 31`** and **`--n
 | `image not found` / pull errors | Image **`ndless-dev:latest`** exists, or set **`NSPIRE_BUILD_IMAGE`**. |
 | Missing headers or `../libretro-gpsp` | Mount is the **repo root**; `gpsp-master` contains **`nspire-libretro-standalone`** and **`libretro-gpsp`**. |
 | Stale objects after branch switch | **`docker compose run --rm ndless-dev make clean all`**. |
-| Permission issues on Linux | Bind-mount UID (not typical on the current Windows host). |
+| Permission issues on Linux | The bind mount's user id. |
 
 ## Related docs
 

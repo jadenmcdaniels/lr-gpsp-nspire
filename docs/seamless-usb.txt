@@ -1,0 +1,50 @@
+gpSP for the TI-Nspire: the seamless USB port
+=============================================
+
+One USB port serves a controller (directly, or through an adapter or a hub), the link cable to another
+calculator, a USB drive, a sound adapter and a Bluetooth dongle. Nothing has to be picked first: gpSP
+watches the port and lets whatever is plugged in come up. The numbers below are the code's;
+tests/host/seamless_tests.py (test_docs) checks that this file and the code agree.
+
+States (nspire_usbport.c)
+-------------------------
+EMPTY, DEVICE_END (the cable's device end), HOST_END (the adapter's end, where gpSP is the host) and
+UNKNOWN (an older CX whose controller is gated off, or a reading that is stale). The port is looked at
+once every 8 calls and at least 122 ms apart (SAMPLE_FRAMES 8): a plug-in waits for one look. The
+observer only reads registers.
+
+Stages at the host end while nothing owns the port (nspire_arbiter.c, between frames only)
+----------------------------------------------------------------------------------------
+0. Wait for the OS's offer of the device: 1500 ms (ARB_STAGE0_MS), and until the link's watch has looked
+   twice since the change, the last look 2750 ms after it (CYCLE_LOOK_MS, nspire_link.c), the watch
+   running 1500 ms (CYCLE_WATCH_MS), and a fresh look lists no other calculator.
+1. A bus power cycle (nspire_usbcycle.c).
+2. Wait again: 4000 ms (ARB_STAGE2_MS). The second cycle comes at the port's age of
+   6000 ms (ARB_CYCLE2_AT_MS) and at least 4500 ms after the first (ARB_CYCLE_GAP_MS), with the
+   toast "Starting the USB device...".
+3. A direct read of the device.
+4. Given up: the last resort's toast, "Unplug the USB device and plug it in again" (ARB_REPLUG_TEXT),
+   once.
+Each stage is logged ("seamless: stage N (...), N ms after the port change"). At most 2 cycles a session
+(ARB_CYCLES_MAX 2); a session ends when the port reads EMPTY for 700 ms (ARB_SESSION_END_MS).
+
+Toasts
+------
+"Controller connected (name)" for a controller (within 3 s of the plug-in), "Linked: player N" for a
+link (within 5 s), "Controller disconnected", "The link cable came out", and
+"Other calculator found: start gpSP there" (a calculator that doesn't answer gpSP's link service for
+10 s, NODE_HINT_MS). The controller driver's own "Plug the controller in again" is never shown;
+"Unplug the USB device and plug it in again" is the last resort only.
+
+What the log says
+-----------------
+- A bus power cycle: "reenum: cycle N (...)" with the registers before, in the drop and after
+  (vbus_valid=...); one the port's registers don't allow: "seamless: cycle N refused (...)".
+- An older CX's gated controller: "reenum: cycle N (ci): the controller was gated off in the drop", then
+  "reenum: the gate opened: PP put back".
+- A controller's input: "first report: slot N, vid:pid, N OS sleeps" once an attach, then "button: slot N,
+  NAME" once for each button.
+tools/seamless_log_check.py LOG... reads these lines back: for each port change the stage that settled
+it, the toast's time against the 3 s / 5 s limits, and each controller's attach, first report, buttons and
+detach. It exits 0 when everything is within its limit, 1 when a toast came too late or the port gave up,
+2 when the file can't be read.
